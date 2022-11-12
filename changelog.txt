@@ -1,0 +1,27 @@
+v0.0.1
+released
+
+v0.0.2
+added antisniper winstreak
+sort by fkdr
+
+v0.0.3
+added star
+fixed bugs
+
+v0.0.4
+added star color
+added minecraft font
+
+v0.0.5
+added log check
+fixed rank colors
+added player strength colors
+added client check (logfile location by bwstats overlay)
+
+v0.1.1
+added settings (data will be saved in %appdata%)
+added about
+
+v0.1.2
+fixed denicker
