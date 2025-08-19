@@ -1,0 +1,6 @@
+pygame
+pyinstaller
+requests
+pyglet
+pyautogui
+mutagen

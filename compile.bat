@@ -1,2 +1,2 @@
-py -m PyInstaller overlay.spec
+py -3.10 -m PyInstaller overlay.spec
 pause
