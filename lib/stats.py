@@ -312,7 +312,7 @@ def get_player(self, mcid, custom = False):
         self.status.update()
         #self.status.set_log(f'''{mcid} ({status})''')
     time.sleep(11)
-    if self.status.last_update < time.time() + 10:
+    if self.status.last_update < time.time() - 10:
         self.status.hide()
 
 def get_data(self, mcid, mode, custom, nick = None):
@@ -331,12 +331,14 @@ def get_data(self, mcid, mode, custom, nick = None):
     if data.get('success'):
         if data['player']:
             data["last_update"] = time.time()
+            data_cache[mcid.lower()] = data
             return bedwars_parse_from_hypixel_api(data, nick, custom)
         return ('Nicked', {})
     if data['cause'] == 'Key throttle':
         time.sleep(0.1)
         if mcid not in self.players and nick not in self.players:
             return ('Cancelled', {})
+        return get_data(self, mcid, "name", custom, nick)
     if data['cause'] == 'You have already looked up this name recently':
         while True:
             data = session.get('https://api.mojang.com/users/profiles/minecraft/{}'.format(mcid))

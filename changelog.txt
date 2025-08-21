@@ -25,3 +25,13 @@ added about
 
 v0.1.2
 fixed denicker
+
+v0.1.3
+added music player
+added auto requeue (beta)
+added compact mode
+
+v0.2.1 (beta)
+keyless stats lookup
+multimode support (in progress)
+autowho without controlling keyboard
