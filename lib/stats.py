@@ -259,16 +259,19 @@ def get_player(self, mcid, custom = False):
             'star': '-',
             'score': 100000 }
         #self.status.set_log(f'''Failed to check (network issue or voids api down)''')
-    self.status.update()
     if status == 'Winstreak Hidden':
         self.player_data[mcid] = data
-        winstreak_data = session.get('https://api.antisniper.net/winstreak?key={}&name={}'.format(self.config.get('antisniper_key'), mcid)).json()
+        while True:
+            try:
+                winstreak_data = session.get('https://api.antisniper.net/winstreak?key={}&name={}'.format(self.config.get('antisniper_key'), mcid)).json()
+                break
+            except:
+                pass
         if winstreak_data['success']:
             try:
                 self.player_data[mcid]['WS'] = winstreak_data['player']['data']['overall_winstreak']
             except:
                 self.player_data[mcid]['WS'] = 0
-            self.status.update()
     if status == 'Nicked':
         try:
             if not custom:
@@ -278,7 +281,7 @@ def get_player(self, mcid, custom = False):
             pass
         self.player_data[mcid] = {
             'Player': mcid,
-            'TAG': 'Nicked (in check)',
+            'TAG': 'Nicked',
             'rank': '-',
             'FKDR': '-',
             'WLR': '-',
@@ -287,6 +290,7 @@ def get_player(self, mcid, custom = False):
             'WS': '-',
             'star': '-',
             'score': 100000 }
+        """
         nick_data = session.get('https://api.antisniper.net/denick?key={}&nick={}'.format(self.config.get('antisniper_key'), mcid)).json()
         if not nick_data.get('player'):
             self.status.set_log(f'''Failed to denick from {mcid}''')
@@ -307,48 +311,65 @@ def get_player(self, mcid, custom = False):
                 self.status.set_log(f'''Failed to denick from {mcid}''')
                 self.player_data[mcid]['TAG'] = 'Nicked'
                 self.status.update()
+        """
     if status == 'Success':
         self.player_data[mcid] = data
-        self.status.update()
         #self.status.set_log(f'''{mcid} ({status})''')
+    self.status.update()
     time.sleep(11)
     if self.status.last_update < time.time() - 10:
         self.status.hide()
 
 def get_data(self, mcid, mode, custom, nick = None):
     #key={}& self.config.get('hypixel_key'), 
-    try:
-        if mcid.lower() in data_cache:
-            if data_cache[mcid.lower()]["last_update"] > time.time() - 60:
-                return bedwars_parse_from_hypixel_api(data_cache[mcid.lower()], nick, custom)
-        if mode == "name":
-            if mcid.lower() in mcid_cache:
-                mode = "uuid"
-                mcid = mcid_cache[mcid.lower()]
-        data = session.get('https://hypixel.voids.top/v2/player?{}={}'.format(mode, mcid)).json()
-    except:
-        return "Failed", {}
+    for n in range(5):
+        try:
+            if mcid.lower() in data_cache:
+                if data_cache[mcid.lower()]["last_update"] > time.time() - 60:
+                    return bedwars_parse_from_hypixel_api(data_cache[mcid.lower()], nick, custom)
+            if mode == "name":
+                if mcid.lower() in mcid_cache:
+                    mode = "uuid"
+                    mcid = mcid_cache[mcid.lower()]
+            data = session.get('https://hypixel.voids.top/v2/player?{}={}'.format(mode, mcid), timeout=5).json()
+            break
+        except:
+            if n == 4:
+                return "Failed", {}
+            traceback.print_exc()
+            continue
     if data.get('success'):
         if data['player']:
             data["last_update"] = time.time()
             data_cache[mcid.lower()] = data
             return bedwars_parse_from_hypixel_api(data, nick, custom)
+        print(data)
         return ('Nicked', {})
+    if not data.get("cause"):
+        print(data)
+        return get_data(self, mcid, mode, custom, nick)
     if data['cause'] == 'Key throttle':
-        time.sleep(0.1)
+        #time.sleep(0.1)
         if mcid not in self.players and nick not in self.players:
             return ('Cancelled', {})
-        return get_data(self, mcid, "name", custom, nick)
+        return get_data(self, mcid, mode, custom, nick)
     if data['cause'] == 'You have already looked up this name recently':
-        while True:
-            data = session.get('https://api.mojang.com/users/profiles/minecraft/{}'.format(mcid))
-            if data.status_code == 204:
-                return ('Nicked', {})
-            if data.status_code != 429:
-                try:
-                    mcid = data.json()['id']
-                    return get_data(self, mcid, "uuid", custom, nick)
-                except:
+        for n in range(5):
+            try:
+                data = session.get('https://api.mojang.com/users/profiles/minecraft/{}'.format(mcid), timeout=2)
+                print(data.text)
+                if data.status_code == 204:
                     return ('Nicked', {})
+                if data.status_code != 429:
+                    try:
+                        mcid = data.json()['id']
+                        return get_data(self, mcid, "uuid", custom, nick)
+                    except:
+                        return ('Nicked', {})
+            except:
+                if n == 4:
+                    return ("Failed", {})
+                traceback.print_exc()
+                continue
     return (data['cause'], { })
 

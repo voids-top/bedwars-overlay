@@ -23,7 +23,7 @@ def process(self, log):
         #self.config.log = 'Hidden'
         ext.send("chat /who")
     if log_chat.startswith('[LC Accounts] Able to login '):
-        self.player = log_chat.replace('[LC Accounts] Able to login ', '')
+        self.mcid = log_chat.replace('[LC Accounts] Able to login ', '')
         self.status.set_log('account change')
     if log_chat.startswith("[CHAT] Can't find a player by the name of '."):
         player = log_chat.split("[CHAT] Can't find a player by the name of '.")[1].split("'")[0]
@@ -46,6 +46,21 @@ def process(self, log):
         self.players.clear()
         self.status.noticed.clear()
         ext.send("chat /who")
+    if log_chat.startswith('[CHAT] You deposited ') and log_chat.endswith("into your Team Chest!"):
+        amount = log_chat.split('[CHAT] You deposited ')[1].split(' into your Team Chest!')[0].split(" ")[0].lstrip("x").strip()
+        item = " ".join(log_chat.split('[CHAT] You deposited ')[1].split(' into your Team Chest!')[0].split(" ")[1:]).strip()
+        if item in ["Emerald", "Diamond"]:
+            ext.send("chat /pc deposited x{} {} into team chest".format(amount, item))
+    if log_chat.startswith('[CHAT] The party was transferred to '):
+        target = log_chat.split("[x")[0].split("by ")[1].strip().split("]")[-1].strip()
+        if self.mcid and not self.mcid.lower() == target.lower():
+            time.sleep(1)
+            ext.send(f"chat /p transfer {target}")
+    if log_chat.startswith('[CHAT] ') and log_chat.endswith("to Party Leader"):
+        target = log_chat.split("[x")[0].split(" has promoted")[0].strip().split("]")[-1].strip()
+        if self.mcid and not self.mcid.lower() == target.lower():
+            time.sleep(1)
+            ext.send(f"chat /p promote {target}")
     if log_chat.startswith('[CHAT] ONLINE: '):
         self.status.show()
         self.players.clear()
