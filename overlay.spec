@@ -8,7 +8,11 @@ a = Analysis(
     ['overlay.py'],
     pathex=[],
     binaries=[],
-    datas=[('Minecraftia.ttf','.')],
+    datas=[
+        ('Minecraftia.ttf','.'),
+        ('injector.exe','.'),
+        ('util.dll','.')
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

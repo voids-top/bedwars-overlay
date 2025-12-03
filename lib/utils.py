@@ -90,13 +90,14 @@ def calc(value):
     seconds = str(int(value)).zfill(2)
     return f'0:{seconds}'
 
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except:
+        base_path = path.abspath('.')
+    return path.join(base_path, relative_path)
+
 def load_font():
-    def resource_path(relative_path):
-        try:
-            base_path = sys._MEIPASS
-        except:
-            base_path = path.abspath('.')
-        return path.join(base_path, relative_path)
     pyglet.font.add_file(resource_path('Minecraftia.ttf'))
 
 def set_appwindow(root):

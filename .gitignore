@@ -3,3 +3,6 @@ albumart.png
 dist/
 build/
 trash/
+ext/*.obj
+ext/*.lib
+ext/*.exo

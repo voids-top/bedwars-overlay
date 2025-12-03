@@ -1,19 +1,3 @@
-// agents_min.cpp — minimal JNI agent that:
-//  - opens a localhost TCP control bus (default 127.0.0.1:46001)
-//  - commands:  "chat <text>", "tab", "score"
-//  - resolves Minecraft instance on Vanilla/obf/Lunar by TCCL fallback
-//  - extracts tab-list names via NetHandlerPlayClient
-//  - dumps scoreboard sidebar if present
-//
-// Build (MSVC x64):
-//   cl /LD /utf-8 /EHsc agents_min.cpp /I"%JAVA_HOME%\include" /I"%JAVA_HOME%\include\win32" Ws2_32.lib
-//
-// Injector must call exported:  extern "C" __declspec(dllexport) DWORD WINAPI StartAgent(LPVOID)
-//
-// Notes:
-//  * No C++17 features (works with /EHsc default)
-//  * Extremely defensive against class-loader differences (Lunar etc.)
-//  * Keep budgets small to avoid UI hitches
 #ifndef AGENTS_MIN_WINSOCK_INCLUDE_GUARD
 #define AGENTS_MIN_WINSOCK_INCLUDE_GUARD
 
@@ -24,18 +8,12 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-// Include winsock2 before windows.h, and never include winsock.h
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 
 #pragma comment(lib, "Ws2_32.lib")
 #endif
-
-
-
-// agents_min.cpp  (MSVC / x64)
-// Build: cl /LD /utf-8 /EHsc agents_min.cpp /I"%JAVA_HOME%\\include" /I"%JAVA_HOME%\\include\\win32" Ws2_32.lib "%JAVA_HOME%\\lib\\jvm.lib"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -49,8 +27,10 @@
 #include <algorithm>
 
 #pragma comment(lib, "Ws2_32.lib")
+#define BUS_HOST "127.0.0.1"
+#define BUS_PORT 46001
 
-// ============ logging ============
+
 static void dlog(const char* fmt, ...) {
     char buf[2048];
     va_list ap; va_start(ap, fmt);
@@ -61,7 +41,6 @@ static void dlog(const char* fmt, ...) {
     OutputDebugStringA("\n");
 }
 
-// ============ JNI glue ===========
 static JavaVM* g_vm = nullptr;
 typedef jint (JNICALL* PFN_JNI_GetCreatedJavaVMs)(JavaVM**, jsize, jsize*);
 
@@ -85,6 +64,22 @@ static JNIEnv* get_env() {
     return env;
 }
 
+struct JniLocalFrame {
+    JNIEnv* env;
+    JniLocalFrame(JNIEnv* e, jint capacity = 64) : env(e) {
+        if (env) {
+            if (env->PushLocalFrame(capacity) < 0) {
+                env = nullptr;
+            }
+        }
+    }
+    ~JniLocalFrame() {
+        if (env) {
+            env->PopLocalFrame(nullptr);
+        }
+    }
+};
+
 static std::string jstr(JNIEnv* env, jstring s) {
     if (!s) return std::string();
     const jchar* pw = env->GetStringChars(s, nullptr);
@@ -104,15 +99,14 @@ static std::string jstr(JNIEnv* env, jstring s) {
     return out;
 }
 
-// remove '§x' color codes and non-ASCII & surrogate/private-use glyphs used by resource packs
 static std::string strip_mc_codes(const std::string& in) {
     std::string out; out.reserve(in.size());
     for (size_t i = 0; i < in.size(); ++i) {
         unsigned char c = (unsigned char)in[i];
         if (c == 0xC2 && i + 1 < in.size() && (unsigned char)in[i+1] == 0xA7) { // UTF-8 '§' starts as 0xC2 0xA7
             // skip '§' and next one byte (format code)
-            i += 1; // now at 0xA7
-            if (i + 1 < in.size()) i += 1; // skip code char
+            i += 1;
+            if (i + 1 < in.size()) i += 1;
             continue;
         }
         if (c == 0xA7) { // raw '§' (rare)
@@ -135,8 +129,6 @@ static std::string strip_mc_codes(const std::string& in) {
     return out;
 }
 
-
-// ============================ small helpers ======================
 static std::string trim(const std::string& s) {
     size_t a = 0, b = s.size();
     while (a < b && (unsigned char)s[a] <= 0x20) ++a;
@@ -144,8 +136,6 @@ static std::string trim(const std::string& s) {
     return s.substr(a, b - a);
 }
 
-
-// 便利: 候補（name,sig）を上から順に試す
 static jmethodID tryMethod(JNIEnv* env, jclass cls,
     const std::vector<std::pair<const char*, const char*>>& cands,
     const char* tag)
@@ -168,7 +158,6 @@ static std::string ascii_only(const std::string& in) {
     return out;
 }
 
-// ============ classloader helpers ===========
 static jobject getTCCL(JNIEnv* env) {
     jclass cThread = env->FindClass("java/lang/Thread");
     if (!cThread) { env->ExceptionClear(); return nullptr; }
@@ -244,7 +233,6 @@ static void collect_loaders(JNIEnv* env, std::vector<jobject>& out) {
     env->DeleteLocalRef(arr);
 }
 
-// ============ find Minecraft & helpers ============
 static jclass find_mc_class(JNIEnv* env) {
     const char* candidates[] = {
         "net.minecraft.client.Minecraft", // deobf
@@ -264,6 +252,7 @@ static jclass find_mc_class(JNIEnv* env) {
     for (auto g: loaders) env->DeleteGlobalRef(g);
     return nullptr;
 }
+
 static jobject get_minecraft_singleton(JNIEnv* env) {
     jclass mc = find_mc_class(env);
     if (!mc) { dlog("step0 NG: Minecraft class not found"); return nullptr; }
@@ -299,7 +288,6 @@ static jobject get_minecraft_singleton(JNIEnv* env) {
     return nullptr;
 }
 
-// ============ network: tiny BUS ============
 static void send_line(SOCKET c, const char* s, bool with_nul=false) {
     if (!s) s = "";
     int sent = 0;
@@ -319,7 +307,7 @@ static void send_line(SOCKET c, const char* s, bool with_nul=false) {
 static void send_line(SOCKET c, const std::string& s, bool with_nul) {
     send_line(c, s.c_str(), with_nul);
 }
-// ============ CHAT ============
+
 static bool send_chat(JNIEnv* env, jobject mc, const char* text) {
     jclass clsMc = env->GetObjectClass(mc);
     jfieldID fidPl = env->GetFieldID(clsMc, "thePlayer", "Lnet/minecraft/client/entity/EntityPlayerSP;");
@@ -338,8 +326,7 @@ static bool send_chat(JNIEnv* env, jobject mc, const char* text) {
     dlog("chat sent (public path)");
     return true;
 }
-// ============ SCOREBOARD (sidebar) ============
-// 依存: dlog, jstr, strip_mc_codes, find_mc_class, get_minecraft_singleton, send_line
+
 static jmethodID try_get_method(JNIEnv* env, jclass cls,
                                 const char* const names[], size_t n,
                                 const char* sig, const char* tag) {
@@ -359,18 +346,7 @@ static std::string class_name_of(JNIEnv* env, jobject obj) {
     if (env->ExceptionCheck() || !js) { env->ExceptionClear(); return {}; }
     std::string s = jstr(env, js); env->DeleteLocalRef(js); return s;
 }
-// ============ SCOREBOARD (sidebar) ============
-// Hypixel のようにエントリ名が不可視文字で、実際の表示は Team の prefix/suffix にあるケースを考慮。
-// 1) Scoreboard.getPlayersTeam(entry) を試す
-// 2) 見つからなければ Scoreboard.getTeam(entry)
-// 3) それでも見つからなければ getTeams() -> 各 Team の membership から entry を探索
-// prefix/suffix は Team と ScorePlayerTeam の両方で取得できるメソッドを動的に解決して使う。
-// ============ SCOREBOARD (sidebar) ============
-// チーム取得: getPlayersTeam -> getTeam -> getTeams()でmembership検索
-// 文字列化: team.formatString(entry) / func_96667_a / a を動的解決
-// 失敗時のみ prefix/suffix 連結。entry が不可視っぽい場合は prefix+suffix を優先。
-// ============ SCOREBOARD (sidebar) ============
-// jstring の往復禁止版: team 取得には必ず "元の jstring" を使う
+
 static void dump_score(JNIEnv* env, SOCKET c) {
     dlog("score: begin");
 
@@ -501,14 +477,12 @@ static void dump_score(JNIEnv* env, SOCKET c) {
         jobject sc = env->GetObjectArrayElement(arr, i);
         if (!sc) continue;
 
-        // ★ ここが重要：元の jstring を温存して使い回す
         jstring jname = (jstring)env->CallObjectMethod(sc, midName);
         if (env->ExceptionCheck()) { env->ExceptionClear(); if (sc) env->DeleteLocalRef(sc); continue; }
-        std::string entryLog = jname ? jstr(env, jname) : std::string(); // ログ/可視用のみ
+        std::string entryLog = jname ? jstr(env, jname) : std::string();
         std::string entryVis = strip_mc_codes(entryLog);
         bool entryInvisible = (entryVis.empty() || (entryVis.size() <= 2 && (unsigned char)entryVis[0] >= 0x80));
 
-        // ---- team を 3 段階で探す（引数は必ず jname のまま）----
         jobject team = nullptr;
         if (midGetPlayersTeam) {
             team = env->CallObjectMethod(scoreboard, midGetPlayersTeam, jname);
@@ -547,7 +521,6 @@ static void dump_score(JNIEnv* env, SOCKET c) {
             } else env->ExceptionClear();
         }
 
-        // ---- 文字列化（まずインスタンス側の formatString/func_96667_a/a を探す）----
         std::string line;
         if (team) {
             jclass clsT = env->GetObjectClass(team);
@@ -580,10 +553,9 @@ static void dump_score(JNIEnv* env, SOCKET c) {
             }
         } else {
             dlog("score: no team for entry '%s'", entryLog.c_str());
-            line = entryVis; // 最後の手段
+            line = entryVis;
         }
 
-        // pts（Hypixel は行順インデックスなので参考値）
         int pts = 0;
         if (midPts) { pts = (int)env->CallIntMethod(sc, midPts); if (env->ExceptionCheck()) { env->ExceptionClear(); pts = 0; } }
 
@@ -1066,7 +1038,6 @@ static void dump_tab_with_color(JNIEnv* env, SOCKET c) {
 }
 
 
-// ============ command dispatch ============
 static void handle_line(const char* line, SOCKET c) {
     if (!line) return;
     dlog("BUS: line='%s'", line);
@@ -1074,9 +1045,12 @@ static void handle_line(const char* line, SOCKET c) {
     if (_strnicmp(line, "chat ", 5) == 0) {
         const char* payload = line + 5;
         if (JNIEnv* env = get_env()) {
+            JniLocalFrame frame(env, 128); // ★ このコマンド中に作られたローカル参照を全部掃除
             jobject mc = get_minecraft_singleton(env);
-            if (!mc) { dlog("ERR: no mc"); send_line(c, "chat: no mc", true); }
-            else {
+            if (!mc) {
+                dlog("ERR: no mc");
+                send_line(c, "chat: no mc", true);
+            } else {
                 bool ok = send_chat(env, mc, payload);
                 send_line(c, ok ? "ok" : "ng", true);
             }
@@ -1085,25 +1059,36 @@ static void handle_line(const char* line, SOCKET c) {
     }
 
     if (_stricmp(line, "tab") == 0) {
-        if (JNIEnv* env = get_env()) dump_tab(env, c);
+        if (JNIEnv* env = get_env()) {
+            JniLocalFrame frame(env, 256);
+            dump_tab(env, c);
+        }
         return;
     }
-    
+
     if (_stricmp(line, "tabc") == 0) {
-        if (JNIEnv* env = get_env()) dump_tab_with_color(env, c);
+        if (JNIEnv* env = get_env()) {
+            JniLocalFrame frame(env, 256);
+            dump_tab_with_color(env, c);
+        }
         return;
     }
 
     if (_stricmp(line, "score") == 0) {
-        if (JNIEnv* env = get_env()) dump_score(env, c);
+        if (JNIEnv* env = get_env()) {
+            JniLocalFrame frame(env, 512);
+            dump_score(env, c);
+        }
         return;
     }
 
     if (_stricmp(line, "id") == 0) {
         if (JNIEnv* env = get_env()) {
+            JniLocalFrame frame(env, 128);
             jobject mc = get_minecraft_singleton(env);
-            if (!mc) { send_line(c, "id: (no mc)", true); }
-            else {
+            if (!mc) {
+                send_line(c, "id: (no mc)", true);
+            } else {
                 std::string nm = get_self_name(env, mc);
                 if (nm.empty()) send_line(c, "id: (unknown)", true);
                 else            send_line(c, std::string("id: ") + nm, true);
@@ -1115,60 +1100,92 @@ static void handle_line(const char* line, SOCKET c) {
     send_line(c, "unknown", true);
 }
 
-// ============ BUS loop ============
 static DWORD WINAPI bus_thread(LPVOID) {
-    WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
-    SOCKET ls = socket(AF_INET, SOCK_STREAM, 0);
-    if (ls == INVALID_SOCKET) { dlog("socket() failed"); return 0; }
-    BOOL opt = TRUE; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-    sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons(46001);
-    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
-    if (bind(ls, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
-        dlog("bind failed (%d)", WSAGetLastError()); closesocket(ls); return 0;
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
+        dlog("WSAStartup failed");
+        return 0;
     }
-    listen(ls, 1);
-    dlog("BUS: listening on 127.0.0.1:46001");
+
+    dlog("BUS: client mode to %s:%d", BUS_HOST, BUS_PORT);
 
     for (;;) {
-        SOCKET c = accept(ls, nullptr, nullptr);
-        if (c == INVALID_SOCKET) break;
-        dlog("BUS: client connected");
-        send_line(c, "hello", false);
+        SOCKET c = socket(AF_INET, SOCK_STREAM, 0);
+        if (c == INVALID_SOCKET) {
+            dlog("socket() failed (%d)", WSAGetLastError());
+            break;
+        }
 
-        char buf[2048]; int used = 0;
+        sockaddr_in addr;
+        ZeroMemory(&addr, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(BUS_PORT);
+        inet_pton(AF_INET, BUS_HOST, &addr.sin_addr);
+
+        if (connect(c, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            dlog("BUS: connect to %s:%d failed (%d), retry",
+                 BUS_HOST, BUS_PORT, err);
+            closesocket(c);
+            Sleep(1000); // 1秒待ってから再接続
+            continue;
+        }
+        
+        dlog("BUS: connected to %s:%d", BUS_HOST, BUS_PORT);
+
+        // プロセスID付きで挨拶
+        DWORD pid = GetCurrentProcessId();
+        char greet[64];
+        _snprintf_s(greet, _TRUNCATE, "hello %lu", (unsigned long)pid);
+        send_line(c, greet, false);
+
+        char buf[2048];
+        int  used = 0;
+
         for (;;) {
             int n = recv(c, buf + used, (int)sizeof(buf) - 1 - used, 0);
             if (n <= 0) {
+                // 残りがあれば最後の 1 行だけ処理
                 if (used > 0) {
                     buf[used] = 0;
-                    size_t L = used; if (L && buf[L-1] == '\r') buf[--L] = 0;
+                    size_t L = used;
+                    if (L && buf[L - 1] == '\r') buf[--L] = 0;
                     handle_line(buf, c);
                 }
-                dlog("BUS: client closed (%d)", n);
+                dlog("BUS: server closed (%d)", n);
                 break;
             }
-            used += n; buf[used] = 0;
+
+            used += n;
+            buf[used] = 0;
 
             char* start = buf;
             for (;;) {
                 char* lf = (char*)memchr(start, '\n', buf + used - start);
                 if (!lf) break;
-                *lf = 0; size_t L = lf - start; if (L && start[L-1] == '\r') start[L-1] = 0;
+                *lf = 0;
+                size_t L = (size_t)(lf - start);
+                if (L && start[L - 1] == '\r') start[L - 1] = 0;
                 handle_line(start, c);
                 start = lf + 1;
             }
+
             int remain = (int)(buf + used - start);
-            if (remain > 0) memmove(buf, start, remain);
+            if (remain > 0 && start != buf) {
+                memmove(buf, start, remain);
+            }
             used = remain;
         }
+
         closesocket(c);
-        dlog("BUS: client done");
+        dlog("BUS: disconnected, retry after delay");
+        Sleep(1000); // 再接続リトライ
     }
 
-    closesocket(ls);
     WSACleanup();
     return 0;
 }
+
 
 // ============ entry ============
 extern "C" __declspec(dllexport)

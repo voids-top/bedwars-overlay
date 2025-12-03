@@ -50,7 +50,7 @@ def render(self, rewrite=False):
                 data.star_color(self.canvas, color, n, self.font)
             except:
                 pass
-            if players[n]['Player'].lower() == self.mcid.lower():
+            if self.mcid and players[n]['Player'].lower() == self.mcid.lower():
                 self.canvas.create_text(places['Player'], 55 + 15 * n, text='You', anchor='center', font=self.font, fill=data.rankcolor(players[n]['rank']), tag='rewrite')
             else:
                 self.canvas.create_text(places['Player'], 55 + 15 * n, text=players[n]['Player'], anchor='center', font=self.font, fill=data.rankcolor(players[n]['rank']), tag='rewrite')

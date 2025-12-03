@@ -331,7 +331,7 @@ def get_data(self, mcid, mode, custom, nick = None):
                 if mcid.lower() in mcid_cache:
                     mode = "uuid"
                     mcid = mcid_cache[mcid.lower()]
-            data = session.get('https://hypixel.voids.top/v2/player?{}={}'.format(mode, mcid), timeout=5).json()
+            data = session.get('https://hypixel.voids.top/v2/player?{}={}'.format(mode, mcid), timeout=3).json()
             break
         except:
             if n == 4:
