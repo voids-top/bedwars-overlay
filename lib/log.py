@@ -1,11 +1,14 @@
 import os
 import time
 import threading
+import re
 from . import ext
 from . import data
 from . import stats
 
 def process(self, log):
+    if "§" in log:
+        log = re.sub("§[0-9a-f]{1}", "", log)
     if not "[Client thread/INFO]: " in log:
         return
     log_chat = log.split('[Client thread/INFO]: ')[1]
