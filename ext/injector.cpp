@@ -101,8 +101,19 @@ static LPTHREAD_START_ROUTINE RemoteGetExportByName(HANDLE h, BYTE* base, const 
 
 int wmain(int argc, wchar_t** argv){
     if(argc<3){ fwprintf(stderr,L"usage: injector_pe_x64_v2.exe <pid> <dll>\n"); return 1; }
-    DWORD pid = wcstoul(argv[1], nullptr, 10);
+    wchar_t* end = nullptr;
+    unsigned long parsedPid = wcstoul(argv[1], &end, 10);
+    if (!argv[1][0] || (end && *end != L'\0') || parsedPid == 0) {
+        fwprintf(stderr, L"[inj] invalid pid: %s\n", argv[1]);
+        return 1;
+    }
+    DWORD pid = (DWORD)parsedPid;
     std::wstring dll = FullPathOf(argv[2]);
+    DWORD attr = GetFileAttributesW(dll.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        die(L"DLL path is invalid");
+    }
 
     HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD|PROCESS_QUERY_INFORMATION|
                                PROCESS_VM_OPERATION|PROCESS_VM_WRITE|PROCESS_VM_READ,
@@ -120,8 +131,10 @@ int wmain(int argc, wchar_t** argv){
     if(!pLL) die(L"GetProcAddress(LoadLibraryW) failed");
     HANDLE hLL=CreateRemoteThread(hProc,nullptr,0,pLL,remote,0,nullptr);
     if(!hLL) die(L"CreateRemoteThread(LoadLibraryW) failed");
-    WaitForSingleObject(hLL,INFINITE);
-    // ★ GetExitCodeThread は使わない（64bitで切り詰められる）
+    if (WaitForSingleObject(hLL, INFINITE) != WAIT_OBJECT_0) die(L"WaitForSingleObject(LoadLibraryW) failed");
+    DWORD llCode = 0;
+    if (!GetExitCodeThread(hLL, &llCode)) die(L"GetExitCodeThread(LoadLibraryW) failed");
+    if (llCode == 0) die(L"LoadLibraryW failed in remote process");
     CloseHandle(hLL);
     VirtualFreeEx(hProc,remote,0,MEM_RELEASE);
 

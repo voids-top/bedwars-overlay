@@ -1,6 +1,5 @@
 from tkinter import Tk, Button, Entry, Label, messagebox, filedialog, font
 import sys
-import pyglet
 import json
 import socket
 from os import path, getenv, mkdir
@@ -8,12 +7,12 @@ from requests import get
 from threading import Thread
 from time import sleep, time
 from . import data
-import pygame
-import pygame._sdl2.audio as sdl2_audio
 from ctypes import windll
 from typing import Tuple
 
 def get_devices(capture_devices: bool=False) -> Tuple[str, ...]:
+    import pygame
+    import pygame._sdl2.audio as sdl2_audio
     init_by_me = not pygame.mixer.get_init()
     if init_by_me:
         pygame.mixer.init()
@@ -94,11 +93,31 @@ def resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
     except:
-        base_path = path.abspath('.')
+        base_path = path.dirname(path.dirname(path.abspath(__file__)))
     return path.join(base_path, relative_path)
 
+def _load_font_windows(font_path):
+    try:
+        FR_PRIVATE = 0x10
+        added = windll.gdi32.AddFontResourceExW(font_path, FR_PRIVATE, 0)
+        if added:
+            return True
+    except Exception:
+        pass
+    return False
+
 def load_font():
-    pyglet.font.add_file(resource_path('Minecraftia.ttf'))
+    font_path = resource_path('Minecraftia.ttf')
+    if not path.exists(font_path):
+        return False
+    if sys.platform.startswith('win'):
+        return _load_font_windows(font_path)
+    try:
+        import pyglet
+        pyglet.font.add_file(font_path)
+        return True
+    except Exception:
+        return False
 
 def set_appwindow(root):
     GWL_EXSTYLE = -20

@@ -70,6 +70,6 @@ class Config:
                     self.config[obj] = default[obj]
         except:
             self.config = default
-            self.config['antisniper_key'] = AntiSniperKeyInput().result
+            self.config['antisniper_key'] = "60ff143a-e0fa-4eaf-8382-e9eda046325c" #AntiSniperKeyInput().result
             self.save_config()
             return

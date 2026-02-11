@@ -17,7 +17,6 @@ from modules import stats, settings, about, music, compact
 
 version = 'v0.1.3'
 button_offset = 0
-utils.load_font()
 
 class Overlay:
     def __init__(self):
@@ -25,6 +24,9 @@ class Overlay:
         self.config.load_config()
         self.status = Status()
         self.tk = Tk()
+        #print("loading")
+        threading.Thread(target=utils.load_font, daemon=True).start()
+        #print("loaded")
         self.tk.attributes('-alpha', 0.0)
         self.tk.update()
         self.tk.configure(background='#000000', highlightbackground='#000000')

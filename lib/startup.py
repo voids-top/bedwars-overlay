@@ -19,23 +19,48 @@ def check_inject(self):
             self.status.injected = True if injected_pids else False
             if self.status.injected:
                 if len(injected_pids) == 1:
+                    # One-time chat test to verify send_chat on Badlion
+                    if not self.status.test_chat_sent:
+                        #ext.send("chat [overlay] Hello from overlay")
+                        #print("[test] chat send ->", ext.recv())
+                        self.status.test_chat_sent = True
                     ext.send("id")
                     result = ext.recv()
-                    if result.startswith("id: "):
+                    #print(result)
+                    if result and result.startswith("id: ") and result.strip() != "id: (unknown)":
                         self.mcid = result[4:].rstrip("\x00").strip()
                         self.status.set_log(f"injected")
                         self.status.injected = True
-                    ext.send("score")
-                    ext.recv()
-                    ext.send("tab")
-                    ext.recv()
+                    else:
+                        # If ID not resolved, allow re-sending chat test on next loop
+                        self.status.test_chat_sent = False
+                    #ext.send("score")
+                    #ext.recv()
+                    #ext.send("tab")
+                    #ext.recv()
             pids = ext.get_pids_by_name("javaw.exe")
             for pid in pids:
                 if not pid in injected_pids:
                     injected_pids.append(pid)
                     titles = ext.get_window_titles_by_pid(pid)
                     if [True for title in titles if "1.8" in title]:
-                        print("[inject]", ext.inject(utils.resource_path("injector.exe"), pid, utils.resource_path("util.dll")))
+                        dll_candidates = (
+                            "build\\util8b.dll",
+                            "build\\util8.dll",
+                            "build\\util7.dll",
+                            "build\\util6.dll",
+                            "build\\util.dll",
+                        )
+                        dll_path = None
+                        for rel in dll_candidates:
+                            p = utils.resource_path(rel)
+                            if utils.path.exists(p):
+                                dll_path = p
+                                break
+                        if dll_path:
+                            print("[inject]", ext.inject(utils.resource_path("injector.exe"), pid, dll_path))
+                        else:
+                            print("[inject] no util dll found")
         except:
             traceback.print_exc()
             pass

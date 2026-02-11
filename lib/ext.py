@@ -143,15 +143,27 @@ def send_line(sock, text: str):
 
 def send(text:str):
     if len(sessions) == 1:
-        for s in sessions.values():
-            send_line(s, text)
+        for a,s in list(sessions.items()):
+            try:
+                send_line(s, text)
+            except ConnectionResetError:
+                try:
+                    del sessions[a]
+                except:
+                    pass
 
 def recv():
     if len(sessions) == 1:
-        for s in sessions.values():
-            return recv_until_nul(s)
+        for a,s in list(sessions.items()):
+            try:
+                return recv_until_nul(s)
+            except ConnectionResetError:
+                try:
+                    del sessions[a]
+                except:
+                    pass
 
 if __name__ == "__main__":
-    #print(send("id"))
-    pids = get_pids_by_name("javaw.exe")
-    print(get_window_titles_by_pid(pids[0]))
+    print(send("id"))
+    #pids = get_pids_by_name("javaw.exe")
+    #print(get_window_titles_by_pid(pids[0]))

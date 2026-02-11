@@ -23,6 +23,7 @@ class Status:
         self.last_notice = 0
         self.temp = TempValue()
         self.injected = False
+        self.test_chat_sent = False
     def set_log(self, log):
         self.log = log
         self.updated = True
