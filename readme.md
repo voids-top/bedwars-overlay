@@ -9,7 +9,7 @@
 ## (*1) how keyless lookup working?
 I created an hypixel api proxy on https://hypixel.voids.top \
 It contains 8 accounts and key refreshing automated. \
-Everyone can use this but global ratelimit is `300(requests) * 8(accounts)` in each 5 minutes. \
+Everyone can use this but global ratelimit is `300(requests) * 13(accounts)` in each 5 minutes. \
  (2025-12-04) I changed the inside proxy to datacenter proxies. You can lookup more faster. and fixed bugs.
 
 ## (*2) about "ext/" 
