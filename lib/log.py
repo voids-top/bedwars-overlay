@@ -49,11 +49,13 @@ def process(self, log):
         self.players.clear()
         self.status.noticed.clear()
         ext.send("chat /who")
-    if log_chat.startswith('[CHAT] You deposited ') and log_chat.endswith("into your Team Chest!"):
-        amount = log_chat.split('[CHAT] You deposited ')[1].split(' into your Team Chest!')[0].split(" ")[0].lstrip("x").strip()
-        item = " ".join(log_chat.split('[CHAT] You deposited ')[1].split(' into your Team Chest!')[0].split(" ")[1:]).strip()
+    if log_chat.startswith('[CHAT] Deposited ') and "into Team Chest!" in log_chat:
+        #amount = log_chat.split('[CHAT] Deposited ')[1].split(' into Team Chest!')[0].split(" ")[0].lstrip("x").strip()
+        #total = log_chat.split('Total)')[0].split('(')[-1].strip(" ")
+        item = " ".join(log_chat.split('[CHAT] Deposited ')[1].split(' into Team Chest!')[0].split(" ")[1:]).strip()
         if item in ["Emerald", "Diamond"]:
-            ext.send("chat /pc deposited x{} {} into team chest".format(amount, item))
+            #ext.send("chat /pc deposited x{} {} into team chest (total {})".format(amount, item, total))
+            ext.send("chat /pc {}".format(log_chat.split("[CHAT] ")[1]))
     if log_chat.startswith('[CHAT] The party was transferred to '):
         target = log_chat.split("[x")[0].split("by ")[1].strip().split("]")[-1].strip()
         if self.mcid and not self.mcid.lower() == target.lower():

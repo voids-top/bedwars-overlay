@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Void Overlay Electron</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="title-wrap">
+          <p class="eyebrow">VOID OVERLAY</p>
+          <h1>Bedwars</h1>
+        </div>
+        <div class="toolbar no-drag">
+          <button id="settingsButton" class="ghost-button" type="button">SETTINGS</button>
+          <button id="closeButton" class="ghost-button" type="button">CLOSE</button>
+        </div>
+      </header>
+
+      <section class="table-panel">
+        <table>
+          <thead>
+            <tr>
+              <th>Star</th>
+              <th>Player</th>
+              <th>Tag</th>
+              <th>WS</th>
+              <th>FKDR</th>
+              <th>WLR</th>
+              <th>Finals</th>
+              <th>Wins</th>
+            </tr>
+          </thead>
+          <tbody id="playersBody">
+            <tr>
+              <td colspan="8" class="empty-cell">No player data yet.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <div id="settingsLayer" class="settings-layer hidden no-drag">
+        <button id="settingsBackdrop" class="settings-backdrop" type="button" aria-label="Close settings"></button>
+        <aside id="settingsPanel" class="settings-panel" aria-modal="true" role="dialog" aria-labelledby="settingsTitle">
+          <div class="settings-header">
+            <h2 id="settingsTitle">Settings</h2>
+            <button id="closeSettingsButton" class="ghost-button" type="button">CLOSE</button>
+          </div>
+
+          <label class="setting">
+            <span>Opacity</span>
+            <input id="opacityInput" type="range" min="20" max="100" step="1">
+          </label>
+
+          <label class="setting">
+            <span>Refresh (ms)</span>
+            <input id="refreshInput" type="number" min="50" max="5000" step="50">
+          </label>
+
+          <label class="setting">
+            <span>FPS</span>
+            <input id="fpsInput" type="number" min="1" max="240" step="1">
+          </label>
+
+          <label class="setting">
+            <span>Mode</span>
+            <select id="modeInput">
+              <option value="bedwars">Bedwars</option>
+            </select>
+          </label>
+
+          <label class="setting-toggle">
+            <span>Auto Hide Empty</span>
+            <input id="autohideInput" class="toggle-input" type="checkbox">
+          </label>
+
+          <label class="setting-toggle">
+            <span>Transparent Background</span>
+            <input id="backgroundInput" class="toggle-input" type="checkbox">
+          </label>
+
+          <div class="setting">
+            <span>Custom Log</span>
+            <div class="setting-inline">
+              <code id="customLogValue">custom</code>
+              <button id="chooseLogButton" class="ghost-button" type="button">CHOOSE</button>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

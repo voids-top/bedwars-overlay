@@ -13,7 +13,7 @@ def check_antisniper_key(key):
 
 def check_inject(self):
     while True:
-        time.sleep(5)
+        time.sleep(10)
         try:
             injected_pids = ext.injected_pids()
             self.status.injected = True if injected_pids else False
@@ -44,23 +44,7 @@ def check_inject(self):
                     injected_pids.append(pid)
                     titles = ext.get_window_titles_by_pid(pid)
                     if [True for title in titles if "1.8" in title]:
-                        dll_candidates = (
-                            "build\\util8b.dll",
-                            "build\\util8.dll",
-                            "build\\util7.dll",
-                            "build\\util6.dll",
-                            "build\\util.dll",
-                        )
-                        dll_path = None
-                        for rel in dll_candidates:
-                            p = utils.resource_path(rel)
-                            if utils.path.exists(p):
-                                dll_path = p
-                                break
-                        if dll_path:
-                            print("[inject]", ext.inject(utils.resource_path("injector.exe"), pid, dll_path))
-                        else:
-                            print("[inject] no util dll found")
+                        print("[inject]", ext.inject(utils.resource_path("injector.exe"), pid, utils.resource_path("util.dll")))
         except:
             traceback.print_exc()
             pass

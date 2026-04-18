@@ -6,7 +6,10 @@ from os import path, getenv, mkdir
 from requests import get
 from threading import Thread
 from time import sleep, time
-from . import data
+try:
+    from . import data
+except:
+    import data
 from ctypes import windll
 from typing import Tuple
 

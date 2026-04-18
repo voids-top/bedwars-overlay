@@ -1,0 +1,15 @@
+{
+  "name": "void-overlay-electron",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron rewrite of the Bedwars overlay.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron ."
+  },
+  "dependencies": {
+    "electron": "^41.2.1",
+    "iconv-lite": "^0.6.3"
+  }
+}
