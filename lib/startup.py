@@ -39,7 +39,7 @@ def check_inject(self):
                     #ext.recv()
                     #ext.send("tab")
                     #ext.recv()
-            if time.time() > start_time + 10:
+            if self.config.get('inject') and time.time() > start_time + 10:
                 pids = ext.get_pids_by_name("javaw.exe")
                 for pid in pids:
                     if not pid in injected_pids:

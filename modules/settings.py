@@ -6,9 +6,10 @@ from modules.popup import AntiSniperKeyInput
 positions = {}
 toggle_items = [
     ('background', 'Transparent Background', 150),
-    ('deposit_notify', 'Deposit Notify', 170),
-    ('auto_party_transfer', 'Auto Party Transfer', 190),
-    ('notify_suspicious_player', 'Notify Suspisious Player', 210),
+    ('inject', 'Inject', 170),
+    ('deposit_notify', 'Deposit Notify', 190),
+    ('auto_party_transfer', 'Auto Party Transfer', 210),
+    ('notify_suspicious_player', 'Notify Suspisious Player', 230),
 ]
 
 
@@ -35,27 +36,27 @@ def render(self, rewrite=False):
         self.canvas.create_line(299, 80, 451, 80, fill='#FFFFFF', width=3, tag='mode')
         self.canvas.create_line(299, 100, 451, 100, fill='#FFFFFF', width=3, tag='mode')
         self.canvas.create_line(299, 120, 451, 120, fill='#FFFFFF', width=3, tag='mode')
-        self.canvas.create_text(125, 265, text='Custom Logfile', anchor='center', font=('Minecraftia', 8), fill='#FFFFFF', tag='mode')
-        self.canvas.create_text(125, 245, text='Mode', anchor='center', font=('Minecraftia', 8), fill='#FFFFFF', tag='mode')
-        self.canvas.create_text(125, 285, text='Reset API Key', anchor='center', font=('Minecraftia', 8), fill='#FFFFFF', tag='mode')
+        self.canvas.create_text(125, 285, text='Custom Logfile', anchor='center', font=('Minecraftia', 8), fill='#FFFFFF', tag='mode')
+        self.canvas.create_text(125, 265, text='Mode', anchor='center', font=('Minecraftia', 8), fill='#FFFFFF', tag='mode')
+        self.canvas.create_text(125, 305, text='Reset API Key', anchor='center', font=('Minecraftia', 8), fill='#FFFFFF', tag='mode')
         for key, text, y in toggle_items:
             draw_toggle_label(self, text, y)
         x = 280
-        y = 285
+        y = 305
         self.canvas.create_line(x - 26, y - 8, x + 25, y - 8, fill='#FFFFFF', width=2, tag='mode')
         self.canvas.create_line(x - 26, y + 8, x + 25, y + 8, fill='#FFFFFF', width=2, tag='mode')
         self.canvas.create_line(x - 25, y - 8, x - 25, y + 8, fill='#FFFFFF', width=2, tag='mode')
         self.canvas.create_line(x + 24, y - 8, x + 24, y + 8, fill='#FFFFFF', width=2, tag='mode')
         self.canvas.create_text(x, y, text='Hypixel', anchor='center', font=('Minecraftia', 7), fill='#FFFFFF', tag='mode')
         x = 370
-        y = 285
+        y = 305
         self.canvas.create_line(x - 36, y - 8, x + 34, y - 8, fill='#FFFFFF', width=2, tag='mode')
         self.canvas.create_line(x - 36, y + 8, x + 34, y + 8, fill='#FFFFFF', width=2, tag='mode')
         self.canvas.create_line(x - 35, y - 8, x - 35, y + 8, fill='#FFFFFF', width=2, tag='mode')
         self.canvas.create_line(x + 33, y - 8, x + 33, y + 8, fill='#FFFFFF', width=2, tag='mode')
         self.canvas.create_text(x, y, text='Antisniper', anchor='center', font=('Minecraftia', 7), fill='#FFFFFF', tag='mode')
         x = 325
-        y = 265
+        y = 285
         self.canvas.create_line(x - 26, y - 8, x + 25, y - 8, fill='#FFFFFF', width=2, tag='mode')
         self.canvas.create_line(x - 26, y + 8, x + 25, y + 8, fill='#FFFFFF', width=2, tag='mode')
         self.canvas.create_line(x - 25, y - 8, x - 25, y + 8, fill='#FFFFFF', width=2, tag='mode')
@@ -70,7 +71,7 @@ def render(self, rewrite=False):
     for key, text, y in toggle_items:
         draw_toggle_state(self, self.config.get(key), y)
     x = 275
-    y = 245
+    y = 265
     color = '#FFFFFF'
     self.canvas.create_line(x - 16, y - 8, x + 15, y - 8, fill=color, width=2, tag='rewrite')
     self.canvas.create_line(x - 16, y + 8, x + 15, y + 8, fill=color, width=2, tag='rewrite')
@@ -78,7 +79,7 @@ def render(self, rewrite=False):
     self.canvas.create_line(x + 14, y - 8, x + 14, y + 8, fill=color, width=2, tag='rewrite')
     self.canvas.create_text(x, y, text='bw', anchor='center', font=('Minecraftia', 7), fill=color, tag='rewrite')
     x = 325
-    y = 245
+    y = 265
     color = colors["not_available"]
     self.canvas.create_line(x - 16, y - 8, x + 15, y - 8, fill=color, width=2, tag='rewrite')
     self.canvas.create_line(x - 16, y + 8, x + 15, y + 8, fill=color, width=2, tag='rewrite')
@@ -86,7 +87,7 @@ def render(self, rewrite=False):
     self.canvas.create_line(x + 14, y - 8, x + 14, y + 8, fill=color, width=2, tag='rewrite')
     self.canvas.create_text(x, y, text='sw', anchor='center', font=('Minecraftia', 7), fill=color, tag='rewrite')
     x = 375
-    y = 245
+    y = 265
     color = colors["not_available"]
     self.canvas.create_line(x - 18, y - 8, x + 17, y - 8, fill=color, width=2, tag='rewrite')
     self.canvas.create_line(x - 18, y + 8, x + 17, y + 8, fill=color, width=2, tag='rewrite')
@@ -103,7 +104,7 @@ def event(self, mode, event):
                 self.status.temp.moving = "fps"
             if 115 <= event.y <= 125:
                 self.status.temp.moving = "refresh"
-        if 300 <= event.x <= 350 and 257 <= event.y <= 273:
+        if 300 <= event.x <= 350 and 277 <= event.y <= 293:
             utils.logfile(self.config)
         if 345 <= event.x <= 370:
             if 145 <= event.y <= 155:
@@ -111,12 +112,14 @@ def event(self, mode, event):
                 self.config.set('background', value)
                 self.tk.wm_attributes('-transparentcolor', 'black' if value else '')
             if 165 <= event.y <= 175:
-                self.config.set('deposit_notify', not self.config.get('deposit_notify'))
+                self.config.set('inject', not self.config.get('inject'))
             if 185 <= event.y <= 195:
-                self.config.set('auto_party_transfer', not self.config.get('auto_party_transfer'))
+                self.config.set('deposit_notify', not self.config.get('deposit_notify'))
             if 205 <= event.y <= 215:
+                self.config.set('auto_party_transfer', not self.config.get('auto_party_transfer'))
+            if 225 <= event.y <= 235:
                 self.config.set('notify_suspicious_player', not self.config.get('notify_suspicious_player'))
-        if 277 <= event.y <= 293:
+        if 297 <= event.y <= 313:
             if 255 <= event.x <= 305:
                 question = utils.askwindow('Hypixel', 'https://api.hypixel.net/key')
                 self.config.set('hypixel_key', question.result)

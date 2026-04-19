@@ -18,6 +18,10 @@ function execFileAsync(file, args, options = {}) {
   });
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function runPowerShellJson(command) {
   const { stdout } = await execFileAsync("powershell", [
     "-NoProfile",
@@ -56,7 +60,7 @@ function decodeLogBuffer(buffer) {
 }
 
 function normalizeChatLine(line) {
-  return line.replace(/§[0-9A-FK-OR]/gi, "");
+  return line.replace(/\uFF82\uFF67[0-9A-FK-OR]/gi, "");
 }
 
 class ElectronOverlayBackend {
@@ -94,9 +98,13 @@ class ElectronOverlayBackend {
     this.clientTimer = null;
     this.injectTimer = null;
     this.idTimer = null;
-    this.lastLogPath = null;
     this.lastIdCheck = 0;
+    this.lastLogPath = null;
     this.injectAttemptAt = new Map();
+    this.noticed = [];
+    this.lastNoticeAt = 0;
+    this.lastPlayerUpdateAt = 0;
+    this.hideTimer = null;
   }
 
   async start() {
@@ -116,6 +124,7 @@ class ElectronOverlayBackend {
     clearInterval(this.injectTimer);
     clearInterval(this.idTimer);
     clearInterval(this.logTimer);
+    clearTimeout(this.hideTimer);
     await this.busServer.stop();
   }
 
@@ -141,6 +150,31 @@ class ElectronOverlayBackend {
     this.emitState();
   }
 
+  setHidden(hidden) {
+    const next = Boolean(hidden);
+    if (this.state.hidden === next) {
+      return;
+    }
+    this.state.hidden = next;
+    this.emitState();
+  }
+
+  showOverlay() {
+    clearTimeout(this.hideTimer);
+    this.lastPlayerUpdateAt = Date.now();
+    this.setHidden(false);
+  }
+
+  scheduleHide() {
+    clearTimeout(this.hideTimer);
+    const token = this.lastPlayerUpdateAt;
+    this.hideTimer = setTimeout(() => {
+      if (this.lastPlayerUpdateAt === token && Date.now() - token >= 10000) {
+        this.setHidden(true);
+      }
+    }, 11000);
+  }
+
   clearPlayers() {
     this.state.players = [];
     this.state.playerData = {};
@@ -156,7 +190,13 @@ class ElectronOverlayBackend {
 
   setPlayerData(name, data) {
     this.state.playerData[name] = data;
+    this.showOverlay();
+    this.scheduleHide();
     this.emitState();
+  }
+
+  clearNoticed() {
+    this.noticed = [];
   }
 
   scheduleLogPolling() {
@@ -164,10 +204,27 @@ class ElectronOverlayBackend {
     this.logTimer = setInterval(() => this.pollLog(), this.state.config.refresh);
   }
 
+  readLogLines(filePath) {
+    try {
+      const stat = fs.statSync(filePath);
+      const start = Math.max(0, stat.size - 100000);
+      const fd = fs.openSync(filePath, "r");
+      const buffer = Buffer.alloc(stat.size - start);
+      fs.readSync(fd, buffer, 0, buffer.length, start);
+      fs.closeSync(fd);
+
+      const text = decodeLogBuffer(buffer);
+      return text.split(/\r?\n/).filter(Boolean);
+    } catch (_error) {
+      return [];
+    }
+  }
+
   resetProcessedLogs(filePath) {
     this.lastLogPath = filePath;
-    this.processedLogs.clear();
-    this.processedLogOrder = [];
+    const seeded = [...new Set(this.readLogLines(filePath))];
+    this.processedLogs = new Set(seeded);
+    this.processedLogOrder = seeded;
   }
 
   async detectClientLog() {
@@ -194,11 +251,13 @@ class ElectronOverlayBackend {
           this.setLog(`Connected to ${client}`);
           this.resetProcessedLogs(filePath);
         }
-        return;
+        return true;
       } catch (_error) {
         continue;
       }
     }
+
+    return false;
   }
 
   pollLog() {
@@ -207,32 +266,20 @@ class ElectronOverlayBackend {
       return;
     }
 
-    try {
-      const stat = fs.statSync(filePath);
-      const start = Math.max(0, stat.size - 100000);
-      const fd = fs.openSync(filePath, "r");
-      const buffer = Buffer.alloc(stat.size - start);
-      fs.readSync(fd, buffer, 0, buffer.length, start);
-      fs.closeSync(fd);
-
-      const text = decodeLogBuffer(buffer);
-      const lines = text.split(/\r?\n/).filter(Boolean);
-      for (const line of lines) {
-        if (this.processedLogs.has(line)) {
-          continue;
-        }
-        this.processedLogs.add(line);
-        this.processedLogOrder.push(line);
-        this.processLogLine(line);
+    const lines = this.readLogLines(filePath);
+    for (const line of lines) {
+      if (this.processedLogs.has(line)) {
+        continue;
       }
+      this.processedLogs.add(line);
+      this.processedLogOrder.push(line);
+      this.processLogLine(line);
+    }
 
-      if (this.processedLogOrder.length > 10000) {
-        const keep = this.processedLogOrder.slice(-5000);
-        this.processedLogs = new Set(keep);
-        this.processedLogOrder = keep;
-      }
-    } catch (_error) {
-      return;
+    if (this.processedLogOrder.length > 10000) {
+      const keep = this.processedLogOrder.slice(-5000);
+      this.processedLogs = new Set(keep);
+      this.processedLogOrder = keep;
     }
   }
 
@@ -244,14 +291,8 @@ class ElectronOverlayBackend {
     }
 
     const chat = cleaned.split(marker)[1];
-    if (chat === "[CHAT]                                   Bed Wars" || chat === "[CHAT]                                   SkyWars") {
-      await this.sendBusCommand("chat /who", { expectResponse: false });
-      return;
-    }
 
-    if (chat === "[CHAT]        ") {
-      this.clearPlayers();
-      this.setLog("server change");
+    if (chat === "[CHAT]                                   Bed Wars" || chat === "[CHAT]                                   SkyWars") {
       await this.sendBusCommand("chat /who", { expectResponse: false });
       return;
     }
@@ -262,23 +303,81 @@ class ElectronOverlayBackend {
       return;
     }
 
+    if (chat.startsWith("[CHAT] Can't find a player by the name of '.")) {
+      const player = chat.split("[CHAT] Can't find a player by the name of '.")[1]?.split("'")[0];
+      if (!player) {
+        return;
+      }
+      if (player === "h") {
+        this.setHidden(true);
+        this.setLog("Hidden");
+        return;
+      }
+      if (player === "s") {
+        this.showOverlay();
+        return;
+      }
+      this.setLog("checking specified player");
+      await this.lookupPlayer(player, { custom: true });
+      return;
+    }
+
+    if (chat.startsWith("[CHAT] Can't find a player by the name of '") && chat.endsWith("?'")) {
+      const player = chat.split("[CHAT] Can't find a player by the name of '")[1]?.split("?'")[0];
+      if (player) {
+        await this.lookupPlayer(player, { custom: false });
+      }
+      return;
+    }
+
+    if (chat === "[CHAT]        ") {
+      this.setLog("server change");
+      this.clearNoticed();
+      this.showOverlay();
+      this.clearPlayers();
+      await this.sendBusCommand("chat /who", { expectResponse: false });
+      return;
+    }
+
+    if (chat.startsWith("[CHAT] Deposited ") && chat.includes("into Team Chest!")) {
+      const item = chat.split("[CHAT] Deposited ")[1]?.split(" into Team Chest!")[0]?.split(" ").slice(1).join(" ").trim();
+      if (this.state.config.deposit_notify && ["Emerald", "Diamond"].includes(item)) {
+        await this.sendBusCommand(`chat /pc ${chat.split("[CHAT] ")[1]}`, { expectResponse: false });
+      }
+      return;
+    }
+
+    if (this.state.config.auto_party_transfer && chat.startsWith("[CHAT] The party was transferred to ")) {
+      const target = chat.split("[x")[0]?.split("by ")[1]?.trim()?.split("]")?.at(-1)?.trim();
+      if (target && this.state.mcid && this.state.mcid.toLowerCase() !== target.toLowerCase()) {
+        await delay(1000);
+        await this.sendBusCommand(`chat /p transfer ${target}`, { expectResponse: false });
+      }
+      return;
+    }
+
+    if (this.state.config.auto_party_transfer && chat.startsWith("[CHAT] ") && chat.endsWith("to Party Leader")) {
+      const target = chat.split("[x")[0]?.split(" has promoted")[0]?.trim()?.split("]")?.at(-1)?.trim();
+      if (target && this.state.mcid && this.state.mcid.toLowerCase() !== target.toLowerCase()) {
+        await delay(1000);
+        await this.sendBusCommand(`chat /p promote ${target}`, { expectResponse: false });
+      }
+      return;
+    }
+
     if (chat.startsWith("[CHAT] ONLINE: ")) {
+      this.showOverlay();
       this.clearPlayers();
       this.setLog("checking players");
-      const players = chat
-        .replace("[CHAT] ONLINE: ", "")
-        .split(" [x")[0]
-        .split(", ")
-        .map((value) => value.trim())
-        .filter(Boolean);
-
+      const players = chat.split("[CHAT] ONLINE: ")[1]?.split(" [x")[0]?.split(", ").map((player) => player.trim()).filter(Boolean) || [];
       for (const player of players) {
-        this.lookupPlayer(player);
+        this.lookupPlayer(player, { custom: false });
       }
       return;
     }
 
     if (chat.startsWith("[CHAT] Mode: ")) {
+      this.showOverlay();
       this.clearPlayers();
       this.setLog("checking players");
       return;
@@ -287,22 +386,69 @@ class ElectronOverlayBackend {
     if (chat.startsWith("[CHAT] Team #")) {
       const player = chat.split(": ")[1]?.split(" [x")[0]?.trim();
       if (player) {
+        this.showOverlay();
         this.setLog("checking players");
-        this.lookupPlayer(player);
+        this.lookupPlayer(player, { custom: false });
       }
     }
   }
 
-  async lookupPlayer(name) {
-    this.addPlayer(name);
-    const result = await this.statsService.lookupPlayer(name, { custom: false });
+  async notify(reason, player, data = {}) {
+    if (!this.state.config.notify_suspicious_player) {
+      return;
+    }
+    if (this.noticed.includes(player)) {
+      return;
+    }
 
-    if (result.status === "Success") {
+    this.noticed.push(player);
+    while (this.lastNoticeAt + 500 > Date.now()) {
+      await delay(500);
+    }
+
+    if (reason === "fkdr") {
+      const rankPrefix = data.rank && !["DEFAULT", "-"].includes(data.rank)
+        ? `[${String(data.rank).replaceAll("_PLUS", "+")}] `
+        : "";
+      await this.sendBusCommand(`chat /pc [!] ${rankPrefix}${player} -> FKDR ${data.FKDR}, Lvl ${data.star}, Finals ${data.Finals}`, {
+        expectResponse: false
+      });
+      this.lastNoticeAt = Date.now();
+      return;
+    }
+
+    if (reason === "nick") {
+      await this.sendBusCommand(`chat /pc [!] ${player} -> Nicked`, {
+        expectResponse: false
+      });
+      this.lastNoticeAt = Date.now();
+    }
+  }
+
+  async lookupPlayer(name, { custom = false } = {}) {
+    this.addPlayer(name);
+    this.showOverlay();
+    const result = await this.statsService.lookupPlayer(name, {
+      config: this.state.config,
+      custom
+    });
+
+    if (["Success", "Winstreak Hidden"].includes(result.status)) {
       this.setPlayerData(name, result.data);
+      try {
+        if (!custom && Number(result.data?.FKDR) >= 5) {
+          await this.notify("fkdr", result.data.Player, result.data);
+        }
+      } catch (_error) {
+        return;
+      }
       return;
     }
 
     if (result.status === "Nicked") {
+      if (!custom) {
+        await this.notify("nick", name);
+      }
       this.setPlayerData(name, {
         Player: name,
         TAG: "Nicked",
@@ -393,6 +539,10 @@ class ElectronOverlayBackend {
       this.injectAttemptAt.delete(pid);
     }
     this.emitState();
+
+    if (!this.state.config.inject) {
+      return;
+    }
 
     const processes = await this.listJavaProcesses();
     for (const processInfo of processes) {

@@ -2,17 +2,19 @@ const path = require("path");
 
 const HOST = "127.0.0.1";
 const BUS_PORTS = [46012, 46011, 46001];
-const VERSION = "0.1.0";
+const VERSION = "0.2.1";
 const DEFAULT_CONFIG = {
   hypixel_key: null,
   antisniper_key: null,
-  fkdr: 100,
   refresh: 100,
   mode: "bedwars",
-  fps: 30,
+  fps: 60,
   opacity: 50,
   background: false,
-  autohide: false,
+  inject: false,
+  deposit_notify: true,
+  auto_party_transfer: true,
+  notify_suspicious_player: true,
   autochat: false,
   geometry: "",
   volume: 10,

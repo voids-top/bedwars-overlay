@@ -103,7 +103,7 @@ class Overlay:
             self.tk.after(self.fps_controller.pause(), self.loop)
             return
         if self.status.mode == 'settings':
-            self.status.add_height = 85
+            self.status.add_height = 105
             self.status.add_width = 0
             settings.render(self, rewrite)
             height, width = (262 + self.status.add_height, 500 + self.status.add_width)

@@ -1,16 +1,64 @@
 {
   "name": "void-overlay-electron",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Electron rewrite of the Bedwars overlay.",
+  "author": "VoidPro",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dev": "electron ."
+    "dev": "electron .",
+    "build:standalone": "electron-builder --win dir --x64",
+    "build:onefile": "electron-builder --win portable --x64",
+    "build:local": "npm run build:standalone && npm run build:onefile"
+  },
+  "build": {
+    "appId": "dev.voidpro.void-overlay-electron",
+    "productName": "Void Overlay Electron",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../Minecraftia.ttf",
+        "to": "Minecraftia.ttf"
+      },
+      {
+        "from": "../injector.exe",
+        "to": "injector.exe"
+      },
+      {
+        "from": "../util.dll",
+        "to": "util.dll"
+      },
+      {
+        "from": "../build",
+        "to": "build",
+        "filter": [
+          "util.dll",
+          "util7.dll",
+          "util8.dll",
+          "util8b.dll"
+        ]
+      }
+    ],
+    "win": {
+      "artifactName": "overlay-electron.exe"
+    }
   },
   "dependencies": {
-    "electron": "^41.2.1",
     "iconv-lite": "^0.6.3",
     "music-metadata": "^11.12.3"
+  },
+  "devDependencies": {
+    "electron": "^41.2.1",
+    "electron-builder": "^26.8.1"
   }
 }
