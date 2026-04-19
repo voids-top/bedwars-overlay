@@ -34,21 +34,7 @@ jobs:
           CI: "true"
 
       - name: Create or update release
-        shell: powershell
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          $asset = "dist\overlay.exe"
-
-          if (-not (Test-Path $asset)) {
-            throw "Build output not found: $asset"
-          }
-
-          gh release view $env:TAG_NAME *> $null
-
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:TAG_NAME $asset --clobber
-          } else {
-            gh release create $env:TAG_NAME $asset --generate-notes
-          }
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/overlay.exe
+          generate_release_notes: true
