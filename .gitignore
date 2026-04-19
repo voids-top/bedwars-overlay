@@ -6,3 +6,4 @@ trash/
 ext/*.obj
 ext/*.lib
 ext/*.exo
+__pycache__
