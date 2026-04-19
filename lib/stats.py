@@ -222,6 +222,8 @@ def skywars_parse_from_hypixel_api(data, nick=None, custom=False):
     })
 
 def notify(self, reason, player, data={}):
+    if not self.config.get('notify_suspicious_player'):
+        return
     if not player in self.status.noticed:
         self.status.noticed.append(player)
         while self.status.last_notice + 0.5 > time.time():

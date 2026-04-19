@@ -1,4 +1,8 @@
 # Void Overlay v0.2.1
+> [!NOTE]
+> electron version is under cooking by codex
+> please wait for release :)
+
 ## features
 * ratelimit handling
 * keyless stats lookup (*1)

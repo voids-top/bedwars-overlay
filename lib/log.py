@@ -53,15 +53,15 @@ def process(self, log):
         #amount = log_chat.split('[CHAT] Deposited ')[1].split(' into Team Chest!')[0].split(" ")[0].lstrip("x").strip()
         #total = log_chat.split('Total)')[0].split('(')[-1].strip(" ")
         item = " ".join(log_chat.split('[CHAT] Deposited ')[1].split(' into Team Chest!')[0].split(" ")[1:]).strip()
-        if item in ["Emerald", "Diamond"]:
+        if self.config.get('deposit_notify') and item in ["Emerald", "Diamond"]:
             #ext.send("chat /pc deposited x{} {} into team chest (total {})".format(amount, item, total))
             ext.send("chat /pc {}".format(log_chat.split("[CHAT] ")[1]))
-    if log_chat.startswith('[CHAT] The party was transferred to '):
+    if self.config.get('auto_party_transfer') and log_chat.startswith('[CHAT] The party was transferred to '):
         target = log_chat.split("[x")[0].split("by ")[1].strip().split("]")[-1].strip()
         if self.mcid and not self.mcid.lower() == target.lower():
             time.sleep(1)
             ext.send(f"chat /p transfer {target}")
-    if log_chat.startswith('[CHAT] ') and log_chat.endswith("to Party Leader"):
+    if self.config.get('auto_party_transfer') and log_chat.startswith('[CHAT] ') and log_chat.endswith("to Party Leader"):
         target = log_chat.split("[x")[0].split(" has promoted")[0].strip().split("]")[-1].strip()
         if self.mcid and not self.mcid.lower() == target.lower():
             time.sleep(1)
@@ -85,9 +85,6 @@ def process(self, log):
         #for player in players:
         player = log_chat.split(': ')[1].split(' [x')[0].strip()
         threading.Thread(target=stats.get_player, args=[self, player], daemon=True).start()
-    #if not log_chat == "[CHAT] Please don't spam the command!" and self.config.get('autorequeue') and self.started:
-    #    utils.lobby(self)
-    #    Thread(self.requeued, True, **('target', 'daemon')).start()
     #if ' has quit!' in log_chat:
     #    log_chat = log_chat.replace('[CHAT] ', '')
     #    player = log_chat.split(' has quit')[0]

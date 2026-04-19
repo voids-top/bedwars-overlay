@@ -3,16 +3,16 @@ from os import getenv, mkdir
 import json
 from tkinter import messagebox
 
-default = {'hypixel_key': None, 'antisniper_key': None, "fkdr": 100, 'refresh': 100, 'mode': 'bedwars', 'fps': 30, 'opacity': 50, 'background': False, 'autochat': False, 'geometry': '', 'volume': 10, 'position': 0, 'log_file': 'custom'}
+default = {'hypixel_key': None, 'antisniper_key': None, 'refresh': 100, 'mode': 'bedwars', 'fps': 30, 'opacity': 50, 'background': False, 'deposit_notify': True, 'auto_party_transfer': True, 'notify_suspicious_player': True, 'autochat': False, 'geometry': '', 'volume': 10, 'position': 0, 'log_file': 'custom'}
 
 validator = {
     "mode": lambda a: a in ["bedwars", "skywars"],
     "opacity": lambda a: 0 <= a <= 100,
     "fps": lambda a: a > 0,
     "background": lambda a: isinstance(a, bool),
-    "autorequeue": lambda a: isinstance(a, bool),
-    "fkdr": lambda a: a > 0,
-    "queuemode": lambda a: a in ["solo", "duo", "squad"],
+    "deposit_notify": lambda a: isinstance(a, bool),
+    "auto_party_transfer": lambda a: isinstance(a, bool),
+    "notify_suspicious_player": lambda a: isinstance(a, bool),
     "geometry": lambda a: isinstance(a, str),
     "volume": lambda a: 0 <= a <= 100,
     "position": lambda a: isinstance(a, int) or isinstance(a, float),

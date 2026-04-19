@@ -15,7 +15,7 @@ from os import getenv
 from tkinter import Canvas, Tk, Entry, Label, Button, filedialog, messagebox, Toplevel
 from modules import stats, settings, about, music, compact
 
-version = 'v0.1.3'
+version = 'v0.2.1'
 button_offset = 0
 
 class Overlay:

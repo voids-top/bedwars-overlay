@@ -6,6 +6,7 @@ from . import utils
 import threading
 import time
 from pathlib import Path
+from tempfile import gettempdir
 from tkinter import PhotoImage
 from os import mkdir, getenv
 from PIL import Image, ImageTk
@@ -31,6 +32,8 @@ class player:
         self.title = ''
         self.artist = ''
         self.album = ''
+        self.albumart_path = Path(gettempdir()) / 'voidoverlay' / 'albumart.png'
+        self.albumart_path.parent.mkdir(parents=True, exist_ok=True)
         self.albumart = None
         self.minialbumart = None
         self.config = config
@@ -77,10 +80,10 @@ class player:
         temp = MP3(file)
         self.duration = temp.info.length
         try:
-            open('albumart.png', 'wb').write(temp['APIC:'].data)
-            image = Image.open('albumart.png')
-            self.albumart = ImageTk.PhotoImage(image.resize((100, 100)))
-            self.minialbumart = ImageTk.PhotoImage(image.resize((22, 22)))
+            self.albumart_path.write_bytes(temp['APIC:'].data)
+            with Image.open(self.albumart_path) as image:
+                self.albumart = ImageTk.PhotoImage(image.resize((100, 100)))
+                self.minialbumart = ImageTk.PhotoImage(image.resize((22, 22)))
         except:
             self.albumart = None
             self.minialbumart = None
