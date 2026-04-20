@@ -45,20 +45,15 @@ jobs:
         shell: cmd
         run: npm.cmd ci
 
-      - name: Build Electron standalone
+      - name: Build Electron zip package
         working-directory: electron-overlay
         shell: cmd
-        run: npm.cmd run build:standalone
-
-      - name: Build Electron portable
-        working-directory: electron-overlay
-        shell: cmd
-        run: npm.cmd run build:onefile
+        run: npm.cmd run build:local
 
       - name: Create or update release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/overlay.exe
-            electron-overlay/release/overlay-electron.exe
+            electron-overlay/release/overlay-electron.zip
           generate_release_notes: true
