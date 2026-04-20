@@ -189,31 +189,6 @@ def recv():
                     del sessions[a]
                 except:
                     pass
-template = """
-       ___
-     o|* *|o
-     o|* *|o
-     o|* *|o
-      \\===/
-       |||
-       |||
-       |||
-       |||
-    ___|||___
-   /   |||   \\
-  /    |||    \\
- |     |||     |
-  \\   (|||)   /
-   |   |||   |
-  /    |||    \\
- /     |||     \\
-/      |||      \\
-|     [===]     |
- \\             /
-  '.         .'
-    '-------'
-"""
-
 
 if __name__ == "__main__":
     threading.Thread(target=accept_loop, daemon=True, args=[0]).start()
@@ -221,13 +196,9 @@ if __name__ == "__main__":
     if not sessions:
        pids = get_pids_by_name("javaw.exe")
        pid = pids[0]
-       inject(utils.resource_path("injector.exe"), pid, "../build/util8b.dll")
+       inject(utils.resource_path("injector.exe"), pid, "../util.dll")
     while not sessions:
         time.sleep(1)
-    print(send("id"))
-    #pids = get_pids_by_name("javaw.exe")
-    #print(get_window_titles_by_pid(pids[0]))
-    #for a in list("abcdefghijklmnopqrstuvwxyz"):
-    for a in template.split("\n"):
-        print(send(f"chat /pc | {a}"))
-        time.sleep(0.5)
+    send("id")
+    print(recv())
+    send(f"chat /pc aaa")

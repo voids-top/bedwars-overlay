@@ -10,6 +10,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('Minecraftia.ttf','.'),
+        ('AgentRunnable.class','.'),
         ('injector.exe','.'),
         ('util.dll','.')
     ],

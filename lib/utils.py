@@ -99,6 +99,9 @@ def resource_path(relative_path):
         base_path = path.dirname(path.dirname(path.abspath(__file__)))
     return path.join(base_path, relative_path)
 
+def find_inject_dll_path():
+    return resource_path("util.dll")
+
 def _load_font_windows(font_path):
     try:
         FR_PRIVATE = 0x10

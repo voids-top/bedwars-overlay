@@ -31,6 +31,7 @@
 #pragma comment(lib, "Ws2_32.lib")
 #define BUS_HOST "127.0.0.1"
 #define BUS_PORT 46012
+#define AGENT_TAG "util"
 // Try ports in order to avoid clashes with other listeners and catch older servers if needed
 static const int BUS_PORTS[] = { BUS_PORT, 46011, 46001 };
 static const size_t BUS_PORTS_COUNT = sizeof(BUS_PORTS) / sizeof(BUS_PORTS[0]);
@@ -63,7 +64,21 @@ static void flog(const char* fmt, ...) {
 
 static JavaVM* g_vm = nullptr;
 static jclass g_cached_mc_class = nullptr;
+static jclass g_agent_runnable_class = nullptr;
+static jmethodID g_agent_runnable_ctor = nullptr;
+static INIT_ONCE g_chat_init_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_chat_cs;
+static HANDLE g_chat_event = nullptr;
+static LONG g_chat_pending_seq = 0;
+static LONG g_chat_done_seq = 0;
+static bool g_chat_result = false;
+static std::string g_chat_message;
 typedef jint (JNICALL* PFN_JNI_GetCreatedJavaVMs)(JavaVM**, jsize, jsize*);
+
+static bool send_chat_now(JNIEnv* env, jobject mc, const char* text);
+static void JNICALL agent_runnable_run_native(JNIEnv* env, jclass, jlong seq);
+static std::string class_name_of_class(JNIEnv* env, jobject clsObj);
+static bool contains_ci(const std::string& haystack, const std::string& needle);
 
 static JNIEnv* get_env() {
     if (!g_vm) {
@@ -258,6 +273,438 @@ static void collect_loaders(JNIEnv* env, std::vector<jobject>& out) {
     env->DeleteLocalRef(arr);
 }
 
+static BOOL CALLBACK init_chat_state_once(PINIT_ONCE, PVOID, PVOID*) {
+    InitializeCriticalSection(&g_chat_cs);
+    g_chat_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    return TRUE;
+}
+
+static void ensure_chat_state() {
+    InitOnceExecuteOnce(&g_chat_init_once, init_chat_state_once, nullptr, nullptr);
+}
+
+static std::wstring module_dir_from_self() {
+    HMODULE hm = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCWSTR)&get_env, &hm) || !hm) {
+        return {};
+    }
+
+    wchar_t path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(hm, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return {};
+
+    std::wstring full(path, n);
+    size_t slash = full.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return {};
+    return full.substr(0, slash);
+}
+
+static std::wstring join_path(const std::wstring& base, const wchar_t* tail) {
+    if (base.empty()) return tail ? std::wstring(tail) : std::wstring();
+    if (!tail || !tail[0]) return base;
+    std::wstring out = base;
+    wchar_t last = out.empty() ? 0 : out.back();
+    if (last != L'\\' && last != L'/') out.push_back(L'\\');
+    out += tail;
+    return out;
+}
+
+static bool read_file_bytes(const std::wstring& path, std::vector<jbyte>& out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 || size.QuadPart > 1 << 20) {
+        CloseHandle(h);
+        return false;
+    }
+
+    out.resize((size_t)size.QuadPart);
+    DWORD read = 0;
+    bool ok = ReadFile(h, out.data(), (DWORD)out.size(), &read, nullptr) && read == out.size();
+    CloseHandle(h);
+    if (!ok) out.clear();
+    return ok;
+}
+
+static jobject get_object_class_loader(JNIEnv* env, jobject obj) {
+    if (!env || !obj) return nullptr;
+    jclass cClass = env->FindClass("java/lang/Class");
+    if (!cClass) { env->ExceptionClear(); return nullptr; }
+    jmethodID midGetCL = env->GetMethodID(cClass, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    if (!midGetCL) { env->ExceptionClear(); return nullptr; }
+
+    jclass cls = env->GetObjectClass(obj);
+    if (!cls) { env->ExceptionClear(); return nullptr; }
+    jobject loader = env->CallObjectMethod(cls, midGetCL);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); loader = nullptr; }
+    env->DeleteLocalRef(cls);
+    return loader;
+}
+
+static bool ensure_agent_runnable_class(JNIEnv* env, jobject mc) {
+    if (!env || !mc) return false;
+    if (g_agent_runnable_class && g_agent_runnable_ctor) return true;
+
+    std::wstring classPath = join_path(module_dir_from_self(), L"AgentRunnable.class");
+    std::vector<jbyte> bytes;
+    if (!read_file_bytes(classPath, bytes)) {
+        flog("chat:sched missing helper class: %ls", classPath.c_str());
+        return false;
+    }
+
+    jobject loader = get_object_class_loader(env, mc);
+    jclass cls = nullptr;
+    if (loader) {
+        cls = forName(env, "AgentRunnable", loader);
+    }
+    if (!cls) {
+        cls = env->DefineClass("AgentRunnable", loader, bytes.data(), (jsize)bytes.size());
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            cls = nullptr;
+        }
+    }
+    if (!cls && loader) {
+        cls = forName(env, "AgentRunnable", loader);
+    }
+    if (loader) env->DeleteLocalRef(loader);
+    if (!cls) {
+        flog("chat:sched failed to define AgentRunnable");
+        return false;
+    }
+
+    jmethodID ctor = env->GetMethodID(cls, "<init>", "(J)V");
+    if (!ctor) {
+        env->ExceptionClear();
+        flog("chat:sched AgentRunnable ctor missing");
+        env->DeleteLocalRef(cls);
+        return false;
+    }
+
+    JNINativeMethod nativeMethods[] = {
+        {(char*)"runNative", (char*)"(J)V", (void*)&agent_runnable_run_native}
+    };
+    if (env->RegisterNatives(cls, nativeMethods, 1) != 0 || env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        flog("chat:sched RegisterNatives failed");
+        env->DeleteLocalRef(cls);
+        return false;
+    }
+
+    g_agent_runnable_class = (jclass)env->NewGlobalRef(cls);
+    g_agent_runnable_ctor = ctor;
+    env->DeleteLocalRef(cls);
+    flog("chat:sched AgentRunnable ready");
+    return g_agent_runnable_class && g_agent_runnable_ctor;
+}
+
+static int score_schedule_method_name(const std::string& name) {
+    if (name == "addScheduledTask") return 300;
+    if (name == "func_152344_a") return 280;
+    if (name == "a") return 160;
+    if (contains_ci(name, "schedule")) return 140;
+    if (contains_ci(name, "task")) return 120;
+    return 0;
+}
+
+static bool invoke_mc_schedule_runnable(JNIEnv* env, jobject mc, jobject runnable) {
+    if (!env || !mc || !runnable) return false;
+
+    jclass cClass = env->FindClass("java/lang/Class");
+    jclass cMethod = env->FindClass("java/lang/reflect/Method");
+    jclass cModifier = env->FindClass("java/lang/reflect/Modifier");
+    jclass cObj = env->FindClass("java/lang/Object");
+    if (!cClass || !cMethod || !cModifier || !cObj) { env->ExceptionClear(); return false; }
+
+    jmethodID midGetMethods = env->GetMethodID(cClass, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;");
+    jmethodID midGetSuper = env->GetMethodID(cClass, "getSuperclass", "()Ljava/lang/Class;");
+    jmethodID midGetName = env->GetMethodID(cMethod, "getName", "()Ljava/lang/String;");
+    jmethodID midGetParams = env->GetMethodID(cMethod, "getParameterTypes", "()[Ljava/lang/Class;");
+    jmethodID midGetRT = env->GetMethodID(cMethod, "getReturnType", "()Ljava/lang/Class;");
+    jmethodID midGetMods = env->GetMethodID(cMethod, "getModifiers", "()I");
+    jmethodID midSetAcc = env->GetMethodID(cMethod, "setAccessible", "(Z)V");
+    jmethodID midInvoke = env->GetMethodID(cMethod, "invoke", "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;");
+    jmethodID midIsStatic = env->GetStaticMethodID(cModifier, "isStatic", "(I)Z");
+    if (!midGetMethods || !midGetSuper || !midGetName || !midGetParams || !midGetRT ||
+        !midGetMods || !midSetAcc || !midInvoke || !midIsStatic) {
+        env->ExceptionClear();
+        return false;
+    }
+
+    jobject bestMethod = nullptr;
+    int bestScore = -1;
+    jobject cur = env->GetObjectClass(mc);
+    int depth = 0;
+    while (cur && depth < 6) {
+        jobjectArray methods = (jobjectArray)env->CallObjectMethod(cur, midGetMethods);
+        if (!env->ExceptionCheck() && methods) {
+            jsize n = env->GetArrayLength(methods);
+            for (jsize i = 0; i < n; ++i) {
+                jobject m = env->GetObjectArrayElement(methods, i);
+                if (!m) continue;
+
+                jint mods = env->CallIntMethod(m, midGetMods);
+                jboolean isStatic = env->CallStaticBooleanMethod(cModifier, midIsStatic, mods);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+                if (isStatic == JNI_TRUE) {
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                jobjectArray params = (jobjectArray)env->CallObjectMethod(m, midGetParams);
+                jsize pc = (!env->ExceptionCheck() && params) ? env->GetArrayLength(params) : -1;
+                if (env->ExceptionCheck()) { env->ExceptionClear(); pc = -1; }
+                if (pc != 1) {
+                    if (params) env->DeleteLocalRef(params);
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                jobject p0 = env->GetObjectArrayElement(params, 0);
+                std::string p0Name = (!env->ExceptionCheck() && p0) ? class_name_of_class(env, p0) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); p0Name.clear(); }
+                if (p0) env->DeleteLocalRef(p0);
+                if (params) env->DeleteLocalRef(params);
+                if (p0Name != "java.lang.Runnable") {
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                jstring jn = (jstring)env->CallObjectMethod(m, midGetName);
+                std::string methodName = jn ? jstr(env, jn) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); methodName.clear(); }
+                if (jn) env->DeleteLocalRef(jn);
+
+                jobject rt = env->CallObjectMethod(m, midGetRT);
+                std::string rtName = (!env->ExceptionCheck() && rt) ? class_name_of_class(env, rt) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); rtName.clear(); }
+                if (rt) env->DeleteLocalRef(rt);
+
+                int score = score_schedule_method_name(methodName);
+                if (contains_ci(rtName, "future")) score += 60;
+                else if (rtName == "java.lang.Object") score += 20;
+                score -= depth * 5;
+
+                if (score > bestScore) {
+                    if (bestMethod) env->DeleteLocalRef(bestMethod);
+                    bestMethod = env->NewLocalRef(m);
+                    bestScore = score;
+                }
+                env->DeleteLocalRef(m);
+            }
+            env->DeleteLocalRef(methods);
+        } else {
+            env->ExceptionClear();
+        }
+
+        jobject next = env->CallObjectMethod(cur, midGetSuper);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            next = nullptr;
+        }
+        env->DeleteLocalRef(cur);
+        cur = next;
+        ++depth;
+    }
+
+    if (!bestMethod) {
+        flog("chat:sched no Runnable scheduler on Minecraft");
+        return false;
+    }
+
+    env->CallVoidMethod(bestMethod, midSetAcc, JNI_TRUE);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    jobjectArray args = env->NewObjectArray(1, cObj, nullptr);
+    if (!args) { env->ExceptionClear(); env->DeleteLocalRef(bestMethod); return false; }
+    env->SetObjectArrayElement(args, 0, runnable);
+    env->CallObjectMethod(bestMethod, midInvoke, mc, args);
+    bool ok = !env->ExceptionCheck();
+    if (!ok) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        flog("chat:sched method invoke failed");
+    } else {
+        flog("chat:sched method invoke ok");
+    }
+    env->DeleteLocalRef(args);
+    env->DeleteLocalRef(bestMethod);
+    return ok;
+}
+
+static bool schedule_chat_on_main_thread(JNIEnv* env, jobject mc, const std::string& msg) {
+    if (!env || !mc || msg.empty()) return false;
+    ensure_chat_state();
+    if (!g_chat_event) return false;
+    if (!ensure_agent_runnable_class(env, mc)) return false;
+
+    LONG seq = InterlockedIncrement(&g_chat_pending_seq);
+    EnterCriticalSection(&g_chat_cs);
+    g_chat_done_seq = 0;
+    g_chat_result = false;
+    g_chat_message = msg;
+    ResetEvent(g_chat_event);
+    LeaveCriticalSection(&g_chat_cs);
+
+    jobject runnable = env->NewObject(g_agent_runnable_class, g_agent_runnable_ctor, (jlong)seq);
+    if (!runnable || env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        flog("chat:sched failed to instantiate AgentRunnable");
+        return false;
+    }
+
+    bool scheduled = invoke_mc_schedule_runnable(env, mc, runnable);
+    env->DeleteLocalRef(runnable);
+    if (!scheduled) return false;
+
+    DWORD wait = WaitForSingleObject(g_chat_event, 2000);
+    if (wait != WAIT_OBJECT_0) {
+        flog("chat:sched wait timeout (%lu)", (unsigned long)wait);
+        return false;
+    }
+
+    EnterCriticalSection(&g_chat_cs);
+    bool ok = (g_chat_done_seq == seq) && g_chat_result;
+    LeaveCriticalSection(&g_chat_cs);
+    flog("chat:sched result=%s", ok ? "ok" : "ng");
+    return ok;
+}
+
+static bool invoke_named_string_method(JNIEnv* env, jobject holder, const char* methodName, const std::string& arg, const char* tag) {
+    if (!env || !holder || !methodName || !methodName[0]) return false;
+
+    jclass cClass = env->FindClass("java/lang/Class");
+    jclass cMethod = env->FindClass("java/lang/reflect/Method");
+    jclass cModifier = env->FindClass("java/lang/reflect/Modifier");
+    jclass cObj = env->FindClass("java/lang/Object");
+    if (!cClass || !cMethod || !cModifier || !cObj) { env->ExceptionClear(); return false; }
+
+    jmethodID midGetMethods = env->GetMethodID(cClass, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;");
+    jmethodID midGetSuper = env->GetMethodID(cClass, "getSuperclass", "()Ljava/lang/Class;");
+    jmethodID midMethodName = env->GetMethodID(cMethod, "getName", "()Ljava/lang/String;");
+    jmethodID midMethodParams = env->GetMethodID(cMethod, "getParameterTypes", "()[Ljava/lang/Class;");
+    jmethodID midMethodMods = env->GetMethodID(cMethod, "getModifiers", "()I");
+    jmethodID midMethodRT = env->GetMethodID(cMethod, "getReturnType", "()Ljava/lang/Class;");
+    jmethodID midSetAcc = env->GetMethodID(cMethod, "setAccessible", "(Z)V");
+    jmethodID midInvoke = env->GetMethodID(cMethod, "invoke", "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;");
+    jmethodID midIsStatic = env->GetStaticMethodID(cModifier, "isStatic", "(I)Z");
+    if (!midGetMethods || !midGetSuper || !midMethodName || !midMethodParams || !midMethodMods ||
+        !midMethodRT || !midSetAcc || !midInvoke || !midIsStatic) {
+        env->ExceptionClear();
+        return false;
+    }
+
+    jobject bestMethod = nullptr;
+    jobject cur = env->GetObjectClass(holder);
+    int depth = 0;
+    while (cur && depth < 6 && !bestMethod) {
+        jobjectArray methods = (jobjectArray)env->CallObjectMethod(cur, midGetMethods);
+        if (!env->ExceptionCheck() && methods) {
+            jsize n = env->GetArrayLength(methods);
+            for (jsize i = 0; i < n && !bestMethod; ++i) {
+                jobject m = env->GetObjectArrayElement(methods, i);
+                if (!m) continue;
+
+                jint mods = env->CallIntMethod(m, midMethodMods);
+                jboolean isStatic = env->CallStaticBooleanMethod(cModifier, midIsStatic, mods);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+                if (isStatic == JNI_TRUE) {
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                jstring jn = (jstring)env->CallObjectMethod(m, midMethodName);
+                std::string actualName = jn ? jstr(env, jn) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); actualName.clear(); }
+                if (jn) env->DeleteLocalRef(jn);
+                if (actualName != methodName) {
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                jobjectArray params = (jobjectArray)env->CallObjectMethod(m, midMethodParams);
+                jsize pc = (!env->ExceptionCheck() && params) ? env->GetArrayLength(params) : -1;
+                if (env->ExceptionCheck()) { env->ExceptionClear(); pc = -1; }
+                if (pc != 1) {
+                    if (params) env->DeleteLocalRef(params);
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                jobject p0 = env->GetObjectArrayElement(params, 0);
+                std::string p0Name = (!env->ExceptionCheck() && p0) ? class_name_of_class(env, p0) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); p0Name.clear(); }
+                if (p0) env->DeleteLocalRef(p0);
+                if (params) env->DeleteLocalRef(params);
+                if (p0Name != "java.lang.String") {
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                bestMethod = env->NewLocalRef(m);
+                env->DeleteLocalRef(m);
+            }
+            env->DeleteLocalRef(methods);
+        } else {
+            env->ExceptionClear();
+        }
+
+        jobject next = env->CallObjectMethod(cur, midGetSuper);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            next = nullptr;
+        }
+        env->DeleteLocalRef(cur);
+        cur = next;
+        ++depth;
+    }
+
+    if (!bestMethod) {
+        flog("%s: method '%s' not found", tag ? tag : "callstr", methodName);
+        return false;
+    }
+
+    env->CallVoidMethod(bestMethod, midSetAcc, JNI_TRUE);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    jobject rt = env->CallObjectMethod(bestMethod, midMethodRT);
+    std::string rtName = (!env->ExceptionCheck() && rt) ? class_name_of_class(env, rt) : std::string();
+    if (env->ExceptionCheck()) { env->ExceptionClear(); rtName.clear(); }
+    if (rt) env->DeleteLocalRef(rt);
+
+    jobjectArray args = env->NewObjectArray(1, cObj, nullptr);
+    jstring jarg = env->NewStringUTF(arg.c_str());
+    env->SetObjectArrayElement(args, 0, jarg);
+    env->CallObjectMethod(bestMethod, midInvoke, holder, args);
+    bool ok = !env->ExceptionCheck();
+    if (!ok) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        flog("%s: invoke '%s' failed", tag ? tag : "callstr", methodName);
+    } else {
+        flog("%s: invoke '%s' ok -> %s", tag ? tag : "callstr", methodName, rtName.empty() ? "?" : rtName.c_str());
+    }
+    env->DeleteLocalRef(jarg);
+    env->DeleteLocalRef(args);
+    env->DeleteLocalRef(bestMethod);
+    return ok;
+}
+
 static bool str_in_list(const std::string& value, const char* const* cands, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         if (value == cands[i]) return true;
@@ -277,6 +724,182 @@ static std::string class_name_of_class(JNIEnv* env, jobject clsObj) {
     env->DeleteLocalRef(js);
     return out;
 }
+
+static std::string ascii_lower(const std::string& in) {
+    std::string out = in;
+    for (size_t i = 0; i < out.size(); ++i) {
+        unsigned char c = (unsigned char)out[i];
+        if (c >= 'A' && c <= 'Z') out[i] = (char)(c - 'A' + 'a');
+    }
+    return out;
+}
+
+static std::string simple_name_of(const std::string& name) {
+    if (name.empty()) return {};
+    size_t pos = name.find_last_of("./$");
+    if (pos == std::string::npos) return name;
+    return name.substr(pos + 1);
+}
+
+static bool contains_ci(const std::string& haystack, const std::string& needle) {
+    if (haystack.empty() || needle.empty()) return false;
+    std::string h = ascii_lower(haystack);
+    std::string n = ascii_lower(needle);
+    return h.find(n) != std::string::npos;
+}
+
+static int relaxed_name_match_score(const std::string& value, const char* const* cands, size_t count) {
+    if (value.empty()) return 0;
+
+    std::string valueLower = ascii_lower(value);
+    std::string valueSimple = simple_name_of(value);
+    std::string valueSimpleLower = ascii_lower(valueSimple);
+    int best = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        const char* candRaw = cands[i];
+        if (!candRaw || !candRaw[0]) continue;
+
+        std::string cand(candRaw);
+        std::string candLower = ascii_lower(cand);
+        std::string candSimple = simple_name_of(cand);
+        std::string candSimpleLower = ascii_lower(candSimple);
+
+        if (value == cand) {
+            best = std::max(best, 140);
+            continue;
+        }
+        if (valueLower == candLower) {
+            best = std::max(best, 130);
+            continue;
+        }
+        if (!valueSimpleLower.empty() && !candSimpleLower.empty()) {
+            if (valueSimpleLower == candSimpleLower) {
+                best = std::max(best, 105);
+                continue;
+            }
+            if (valueSimpleLower.find(candSimpleLower) != std::string::npos ||
+                candSimpleLower.find(valueSimpleLower) != std::string::npos) {
+                best = std::max(best, 80);
+                continue;
+            }
+        }
+        if (valueLower.find(candLower) != std::string::npos ||
+            candLower.find(valueLower) != std::string::npos) {
+            best = std::max(best, 60);
+        }
+    }
+    return best;
+}
+
+static bool has_method(JNIEnv* env, jclass cls, const char* name, const char* sig) {
+    if (!env || !cls || !name || !sig) return false;
+    jmethodID mid = env->GetMethodID(cls, name, sig);
+    if (mid) return true;
+    env->ExceptionClear();
+    return false;
+}
+
+static bool has_field(JNIEnv* env, jclass cls, const char* name, const char* sig) {
+    if (!env || !cls || !name || !sig) return false;
+    jfieldID fid = env->GetFieldID(cls, name, sig);
+    if (fid) return true;
+    env->ExceptionClear();
+    return false;
+}
+
+static int score_session_like_class(JNIEnv* env, jclass cls) {
+    if (!env || !cls) return 0;
+
+    int score = 0;
+    std::string clsName = class_name_of_class(env, cls);
+    std::string simpleLower = ascii_lower(simple_name_of(clsName));
+    if (simpleLower == "session") score += 110;
+    else if (simpleLower.find("session") != std::string::npos) score += 85;
+    else if (contains_ci(clsName, "session")) score += 65;
+
+    if (has_method(env, cls, "getUsername", "()Ljava/lang/String;")) score += 95;
+    if (has_method(env, cls, "func_111285_c", "()Ljava/lang/String;")) score += 80;
+    if (has_method(env, cls, "c", "()Ljava/lang/String;")) score += 30;
+
+    if (has_method(env, cls, "getProfile", "()Lcom/mojang/authlib/GameProfile;")) score += 95;
+    if (has_method(env, cls, "func_148256_e", "()Lcom/mojang/authlib/GameProfile;")) score += 80;
+    if (has_method(env, cls, "getProfile", "()Ljava/lang/Object;")) score += 55;
+    if (has_method(env, cls, "func_148256_e", "()Ljava/lang/Object;")) score += 45;
+
+    if (has_method(env, cls, "getPlayerID", "()Ljava/lang/String;")) score += 18;
+    if (has_method(env, cls, "getToken", "()Ljava/lang/String;")) score += 12;
+    return score;
+}
+
+static int score_player_like_class(JNIEnv* env, jclass cls) {
+    if (!env || !cls) return 0;
+
+    int score = 0;
+    std::string clsName = class_name_of_class(env, cls);
+    std::string simpleLower = ascii_lower(simple_name_of(clsName));
+    if (simpleLower == "entityplayersp" || simpleLower == "bew") score += 130;
+    else if (simpleLower.find("entityplayersp") != std::string::npos) score += 110;
+    else if (simpleLower.find("playersp") != std::string::npos) score += 95;
+    else if (simpleLower.find("player") != std::string::npos) score += 55;
+
+    if (has_method(env, cls, "sendChatMessage", "(Ljava/lang/String;)V")) score += 70;
+    if (has_method(env, cls, "a", "(Ljava/lang/String;)V")) score += 28;
+
+    if (has_method(env, cls, "getGameProfile", "()Lcom/mojang/authlib/GameProfile;")) score += 95;
+    if (has_method(env, cls, "func_146103_bH", "()Lcom/mojang/authlib/GameProfile;")) score += 80;
+    if (has_method(env, cls, "getGameProfile", "()Ljava/lang/Object;")) score += 50;
+
+    if (has_method(env, cls, "getName", "()Ljava/lang/String;")) score += 45;
+    if (has_method(env, cls, "getCommandSenderName", "()Ljava/lang/String;")) score += 45;
+    if (has_field(env, cls, "sendQueue", "Lnet/minecraft/client/network/NetHandlerPlayClient;")) score += 35;
+    if (has_field(env, cls, "c", "Lbcy;") || has_field(env, cls, "b", "Lbcy;") || has_field(env, cls, "a", "Lbcy;")) score += 25;
+    return score;
+}
+
+static int score_net_handler_like_class(JNIEnv* env, jclass cls) {
+    if (!env || !cls) return 0;
+
+    int score = 0;
+    std::string clsName = class_name_of_class(env, cls);
+    std::string simpleLower = ascii_lower(simple_name_of(clsName));
+    if (simpleLower == "nethandlerplayclient" || simpleLower == "bcy") score += 130;
+    else if (simpleLower.find("nethandlerplayclient") != std::string::npos) score += 110;
+    else if (simpleLower.find("nethandler") != std::string::npos) score += 85;
+    else if (simpleLower.find("networkhandler") != std::string::npos) score += 70;
+
+    if (has_method(env, cls, "getPlayerInfoMap", "()Ljava/util/Collection;")) score += 90;
+    if (has_method(env, cls, "getPlayerInfoList", "()Ljava/util/Collection;")) score += 90;
+    if (has_method(env, cls, "func_175106_d", "()Ljava/util/Collection;")) score += 80;
+    if (has_method(env, cls, "b", "()Ljava/util/Collection;")) score += 30;
+
+    if (has_method(env, cls, "getPlayerInfo", "(Ljava/util/UUID;)Lnet/minecraft/client/network/NetworkPlayerInfo;")) score += 90;
+    if (has_method(env, cls, "func_175104_a", "(Ljava/util/UUID;)Lnet/minecraft/client/network/NetworkPlayerInfo;")) score += 80;
+    if (has_method(env, cls, "getPlayerInfo", "(Ljava/util/UUID;)Ljava/lang/Object;")) score += 50;
+
+    if (has_method(env, cls, "addToSendQueue", "(Lnet/minecraft/network/Packet;)V")) score += 55;
+    if (has_method(env, cls, "sendPacket", "(Lnet/minecraft/network/Packet;)V")) score += 45;
+    if (has_method(env, cls, "a", "(Lff;)V")) score += 24;
+    return score;
+}
+
+static int score_game_profile_like_class(JNIEnv* env, jclass cls) {
+    if (!env || !cls) return 0;
+
+    int score = 0;
+    std::string clsName = class_name_of_class(env, cls);
+    std::string simpleLower = ascii_lower(simple_name_of(clsName));
+    if (simpleLower == "gameprofile") score += 140;
+    else if (simpleLower.find("gameprofile") != std::string::npos) score += 120;
+    else if (contains_ci(clsName, "gameprofile")) score += 90;
+
+    if (has_method(env, cls, "getName", "()Ljava/lang/String;")) score += 60;
+    if (has_method(env, cls, "getId", "()Ljava/util/UUID;")) score += 60;
+    if (has_method(env, cls, "getProperties", "()Lcom/mojang/authlib/properties/PropertyMap;")) score += 25;
+    return score;
+}
+
+typedef int (*score_class_fn)(JNIEnv*, jclass);
 
 static void cache_mc_class(JNIEnv* env, jclass cls) {
     if (!env || !cls) return;
@@ -821,7 +1444,7 @@ static jobject make_chat_packet(JNIEnv* env, jclass cC01, jstring jmsg) {
     return pkt;
 }
 
-static bool send_chat(JNIEnv* env, jobject mc, const char* text) {
+static bool send_chat_now(JNIEnv* env, jobject mc, const char* text) {
     if (!env || !mc || !text) return false;
 
     // Sanitize/trim and enforce vanilla length limit (~256 chars)
@@ -831,6 +1454,42 @@ static bool send_chat(JNIEnv* env, jobject mc, const char* text) {
     {
         std::string msgLog = ascii_only(msg);
         dlog("chat: request='%s'", msgLog.c_str());
+        flog("chat: request(now)='%s'", msgLog.c_str());
+    }
+
+    // Targeted Badlion probe: invoke the discovered player.e(String) on the main thread only.
+    {
+        jobject player = find_player_object(env, mc);
+        if (!player) {
+            flog("chat:e5 player not found");
+            return false;
+        }
+        jclass clsPl = env->GetObjectClass(player);
+        if (!clsPl) {
+            env->ExceptionClear();
+            flog("chat:e5 no player class");
+            return false;
+        }
+        jmethodID midChat = env->GetMethodID(clsPl, "e", "(Ljava/lang/String;)V");
+        if (!midChat) {
+            env->ExceptionClear();
+            flog("chat:e5 method e(String) not found");
+            env->DeleteLocalRef(clsPl);
+            return false;
+        }
+        jstring jmsg = env->NewStringUTF(msg.c_str());
+        env->CallVoidMethod(player, midChat, jmsg);
+        bool ok = !env->ExceptionCheck();
+        if (!ok) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            flog("chat:e5 invoke failed");
+        } else {
+            flog("chat:e5 invoke ok");
+        }
+        env->DeleteLocalRef(jmsg);
+        env->DeleteLocalRef(clsPl);
+        return ok;
     }
 
     jclass clsMc = env->GetObjectClass(mc);
@@ -891,6 +1550,7 @@ static bool send_chat(JNIEnv* env, jobject mc, const char* text) {
                                         env->DeleteLocalRef(cNet);
                                         env->DeleteLocalRef(net);
                                         dlog("chat sent (packet path via mc.getNetHandler)");
+                                        flog("chat sent (packet path via mc.getNetHandler)");
                                         return true;
                                     }
                                 }
@@ -1039,8 +1699,13 @@ static bool send_chat(JNIEnv* env, jobject mc, const char* text) {
                                             env->DeleteLocalRef(cNet);
                                             env->DeleteLocalRef(net);
                                             if (sentOK) {
-                                                if (usedChannel) dlog("chat sent (Channel path via mc.getNetHandler)");
-                                                else dlog("chat sent (NetworkManager path via mc.getNetHandler)");
+                                                if (usedChannel) {
+                                                    dlog("chat sent (Channel path via mc.getNetHandler)");
+                                                    flog("chat sent (Channel path via mc.getNetHandler)");
+                                                } else {
+                                                    dlog("chat sent (NetworkManager path via mc.getNetHandler)");
+                                                    flog("chat sent (NetworkManager path via mc.getNetHandler)");
+                                                }
                                                 return true;
                                             }
                                         } else { env->ExceptionClear(); }
@@ -1062,6 +1727,35 @@ static bool send_chat(JNIEnv* env, jobject mc, const char* text) {
 
     jobject player = find_player_object(env, mc);
     if (!player) { dlog("chat: player null"); return false; }
+    bool directPreferredOk = false;
+
+    // Prefer EntityPlayerSP.sendChatMessage on Badlion.
+    {
+        jclass clsPl = env->GetObjectClass(player);
+        if (!clsPl) { env->ExceptionClear(); dlog("chat: no player class"); return false; }
+        jmethodID midChat = env->GetMethodID(clsPl, "sendChatMessage", "(Ljava/lang/String;)V");
+        if (!midChat) { env->ExceptionClear(); midChat = env->GetMethodID(clsPl, "a", "(Ljava/lang/String;)V"); }
+        if (midChat) {
+            jstring jmsg = env->NewStringUTF(msg.c_str());
+            env->CallVoidMethod(player, midChat, jmsg);
+            bool ok = !env->ExceptionCheck();
+            if (!ok) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                dlog("chat: direct path threw; falling back to packet path");
+            }
+            env->DeleteLocalRef(jmsg);
+            env->DeleteLocalRef(clsPl);
+            if (ok) {
+                dlog("chat direct path preferred invoked; continuing to packet verification");
+                flog("chat direct path preferred invoked; continuing to packet verification");
+                directPreferredOk = true;
+            }
+        } else {
+            dlog("chat: direct method not found; trying packet path");
+            env->DeleteLocalRef(clsPl);
+        }
+    }
 
     // Try Badlion-safe packet path first: NetHandlerPlayClient.addToSendQueue(new C01PacketChatMessage(msg))
     do {
@@ -1259,7 +1953,17 @@ static bool send_chat(JNIEnv* env, jobject mc, const char* text) {
                     env->DeleteLocalRef(nm);
                     env->DeleteLocalRef(cNet);
                     env->DeleteLocalRef(net);
-                    if (sentOK) { dlog(usedChannel ? "chat sent (Channel path)" : "chat sent (NetworkManager path)"); env->DeleteLocalRef(cPl); return true; }
+                    if (sentOK) {
+                        if (usedChannel) {
+                            dlog("chat sent (Channel path)");
+                            flog("chat sent (Channel path)");
+                        } else {
+                            dlog("chat sent (NetworkManager path)");
+                            flog("chat sent (NetworkManager path)");
+                        }
+                        env->DeleteLocalRef(cPl);
+                        return true;
+                    }
                 } else { env->ExceptionClear(); }
             }
 
@@ -1287,9 +1991,14 @@ static bool send_chat(JNIEnv* env, jobject mc, const char* text) {
         env->DeleteLocalRef(cNet);
         env->DeleteLocalRef(net);
 
-        if (ok) { dlog("chat sent (packet path)"); env->DeleteLocalRef(cPl); return true; }
+        if (ok) { dlog("chat sent (packet path)"); flog("chat sent (packet path)"); env->DeleteLocalRef(cPl); return true; }
         env->DeleteLocalRef(cPl);
     } while (0);
+
+    if (directPreferredOk) {
+        flog("chat: direct preferred returned without a verified packet path");
+        return false;
+    }
 
     // Fallback: call EntityPlayerSP.sendChatMessage directly (vanilla/Lunar etc.)
     {
@@ -1304,8 +2013,54 @@ static bool send_chat(JNIEnv* env, jobject mc, const char* text) {
         env->DeleteLocalRef(jmsg);
         env->DeleteLocalRef(clsPl);
         dlog("chat sent (direct path)");
+        flog("chat sent (direct path)");
         return true;
     }
+}
+
+static void JNICALL agent_runnable_run_native(JNIEnv* env, jclass, jlong seq) {
+    ensure_chat_state();
+    std::string msg;
+
+    EnterCriticalSection(&g_chat_cs);
+    if ((LONG)seq != g_chat_pending_seq) {
+        LeaveCriticalSection(&g_chat_cs);
+        return;
+    }
+    msg = g_chat_message;
+    LeaveCriticalSection(&g_chat_cs);
+
+    bool ok = false;
+    if (env) {
+        JniLocalFrame frame(env, 256);
+        jobject mc = get_minecraft_singleton(env);
+        ok = mc ? send_chat_now(env, mc, msg.c_str()) : false;
+    }
+
+    EnterCriticalSection(&g_chat_cs);
+    if ((LONG)seq == g_chat_pending_seq) {
+        g_chat_result = ok;
+        g_chat_done_seq = (LONG)seq;
+        if (g_chat_event) SetEvent(g_chat_event);
+    }
+    LeaveCriticalSection(&g_chat_cs);
+}
+
+static bool send_chat(JNIEnv* env, jobject mc, const char* text) {
+    if (!env || !mc || !text) return false;
+
+    std::string msg = trim(std::string(text));
+    if (msg.empty()) return false;
+    if (msg.size() > 256) msg.resize(256);
+
+    flog("chat: request='%s'", ascii_only(msg).c_str());
+    if (schedule_chat_on_main_thread(env, mc, msg)) {
+        flog("chat: scheduled path ok");
+        return true;
+    }
+
+    flog("chat: scheduled path unavailable, fallback direct");
+    return send_chat_now(env, mc, msg.c_str());
 }
 
 static jmethodID try_get_method(JNIEnv* env, jclass cls,
@@ -1351,6 +2106,11 @@ static jobject reflect_find_instance_field_object(JNIEnv* env, jobject target,
         return nullptr;
     }
 
+    jobject bestValue = nullptr;
+    int bestScore = 0;
+    std::string bestFieldName;
+    std::string bestTypeName;
+
     jobject cur = env->GetObjectClass(target);
     while (cur) {
         jobjectArray fields = (jobjectArray)env->CallObjectMethod(cur, midGetFields);
@@ -1376,32 +2136,37 @@ static jobject reflect_find_instance_field_object(JNIEnv* env, jobject target,
                     continue;
                 }
 
-                bool matches = (fieldNameCount == 0 && typeNameCount == 0);
                 jstring jn = (jstring)env->CallObjectMethod(f, midFieldName);
                 std::string fieldName = jn ? jstr(env, jn) : std::string();
                 if (env->ExceptionCheck()) { env->ExceptionClear(); fieldName.clear(); }
                 if (jn) env->DeleteLocalRef(jn);
-                if (!matches && fieldNameCount > 0 && str_in_list(fieldName, fieldNames, fieldNameCount)) matches = true;
 
                 jobject type = env->CallObjectMethod(f, midFieldType);
                 std::string typeName;
                 if (!env->ExceptionCheck() && type) typeName = class_name_of_class(env, type);
                 else env->ExceptionClear();
-                if (!matches && typeNameCount > 0 && str_in_list(typeName, typeNames, typeNameCount)) matches = true;
 
-                if (matches) {
+                int fieldScore = (fieldNameCount > 0) ? relaxed_name_match_score(fieldName, fieldNames, fieldNameCount) : 0;
+                int typeScore = (typeNameCount > 0) ? relaxed_name_match_score(typeName, typeNames, typeNameCount) : 0;
+                int candidateScore = std::max(fieldScore, typeScore);
+                if (fieldScore > 0 && typeScore > 0) candidateScore += 20;
+                if (fieldNameCount == 0 && typeNameCount == 0) candidateScore = 1;
+
+                if (candidateScore > 0) {
                     if (midSetAcc) env->CallVoidMethod(f, midSetAcc, JNI_TRUE);
                     jobject value = env->CallObjectMethod(f, midFieldGet, target);
                     if (!env->ExceptionCheck() && value) {
-                        dlog("%s: reflected field %s (%s)", tag, fieldName.c_str(), typeName.c_str());
-                        if (type) env->DeleteLocalRef(type);
-                        env->DeleteLocalRef(f);
-                        env->DeleteLocalRef(fields);
-                        env->DeleteLocalRef(cur);
-                        return value;
+                        if (candidateScore > bestScore) {
+                            if (bestValue) env->DeleteLocalRef(bestValue);
+                            bestValue = value;
+                            bestScore = candidateScore;
+                            bestFieldName = fieldName;
+                            bestTypeName = typeName;
+                        } else {
+                            env->DeleteLocalRef(value);
+                        }
                     }
                     env->ExceptionClear();
-                    if (value) env->DeleteLocalRef(value);
                 }
 
                 if (type) env->DeleteLocalRef(type);
@@ -1417,6 +2182,11 @@ static jobject reflect_find_instance_field_object(JNIEnv* env, jobject target,
         }
         env->DeleteLocalRef(cur);
         cur = next;
+    }
+
+    if (bestValue) {
+        dlog("%s: reflected field %s (%s) score=%d", tag, bestFieldName.c_str(), bestTypeName.c_str(), bestScore);
+        return bestValue;
     }
     return nullptr;
 }
@@ -1450,6 +2220,11 @@ static jobject reflect_invoke_zero_arg_instance_method_object(JNIEnv* env, jobje
 
     jobjectArray emptyArgs = env->NewObjectArray(0, cObj, nullptr);
     if (!emptyArgs) { env->ExceptionClear(); return nullptr; }
+
+    jobject bestMethod = nullptr;
+    int bestScore = 0;
+    std::string bestMethodName;
+    std::string bestReturnTypeName;
 
     jobject cur = env->GetObjectClass(target);
     while (cur) {
@@ -1485,34 +2260,28 @@ static jobject reflect_invoke_zero_arg_instance_method_object(JNIEnv* env, jobje
                     continue;
                 }
 
-                bool matches = (methodNameCount == 0 && returnTypeCount == 0);
                 jstring jn = (jstring)env->CallObjectMethod(m, midMethodName);
                 std::string methodName = jn ? jstr(env, jn) : std::string();
                 if (env->ExceptionCheck()) { env->ExceptionClear(); methodName.clear(); }
                 if (jn) env->DeleteLocalRef(jn);
-                if (!matches && methodNameCount > 0 && str_in_list(methodName, methodNames, methodNameCount)) matches = true;
 
                 jobject rt = env->CallObjectMethod(m, midMethodRT);
                 std::string rtName;
                 if (!env->ExceptionCheck() && rt) rtName = class_name_of_class(env, rt);
                 else env->ExceptionClear();
-                if (!matches && returnTypeCount > 0 && str_in_list(rtName, returnTypeNames, returnTypeCount)) matches = true;
 
-                if (matches) {
-                    if (midSetAcc) env->CallVoidMethod(m, midSetAcc, JNI_TRUE);
-                    jobject value = env->CallObjectMethod(m, midInvoke, target, emptyArgs);
-                    if (!env->ExceptionCheck() && value) {
-                        dlog("%s: reflected method %s (%s)", tag, methodName.c_str(), rtName.c_str());
-                        if (rt) env->DeleteLocalRef(rt);
-                        if (params) env->DeleteLocalRef(params);
-                        env->DeleteLocalRef(m);
-                        env->DeleteLocalRef(methods);
-                        env->DeleteLocalRef(cur);
-                        env->DeleteLocalRef(emptyArgs);
-                        return value;
-                    }
-                    env->ExceptionClear();
-                    if (value) env->DeleteLocalRef(value);
+                int nameScore = (methodNameCount > 0) ? relaxed_name_match_score(methodName, methodNames, methodNameCount) : 0;
+                int typeScore = (returnTypeCount > 0) ? relaxed_name_match_score(rtName, returnTypeNames, returnTypeCount) : 0;
+                int candidateScore = std::max(nameScore, typeScore);
+                if (nameScore > 0 && typeScore > 0) candidateScore += 20;
+                if (methodNameCount == 0 && returnTypeCount == 0) candidateScore = 1;
+
+                if (candidateScore > bestScore) {
+                    if (bestMethod) env->DeleteLocalRef(bestMethod);
+                    bestMethod = env->NewLocalRef(m);
+                    bestScore = candidateScore;
+                    bestMethodName = methodName;
+                    bestReturnTypeName = rtName;
                 }
 
                 if (rt) env->DeleteLocalRef(rt);
@@ -1531,8 +2300,425 @@ static jobject reflect_invoke_zero_arg_instance_method_object(JNIEnv* env, jobje
         cur = next;
     }
 
+    if (bestMethod) {
+        if (midSetAcc) env->CallVoidMethod(bestMethod, midSetAcc, JNI_TRUE);
+        jobject value = env->CallObjectMethod(bestMethod, midInvoke, target, emptyArgs);
+        env->DeleteLocalRef(bestMethod);
+        if (!env->ExceptionCheck() && value) {
+            dlog("%s: reflected method %s (%s) score=%d", tag, bestMethodName.c_str(), bestReturnTypeName.c_str(), bestScore);
+            env->DeleteLocalRef(emptyArgs);
+            return value;
+        }
+        env->ExceptionClear();
+    }
     env->DeleteLocalRef(emptyArgs);
     return nullptr;
+}
+
+static jobject reflect_find_best_instance_field_object_by_score(JNIEnv* env, jobject target,
+                                                                const char* const* fieldNameHints, size_t fieldNameHintCount,
+                                                                score_class_fn scoreFn, int minScore,
+                                                                const char* tag) {
+    if (!env || !target || !scoreFn) return nullptr;
+
+    jclass cClass = env->FindClass("java/lang/Class");
+    jclass cField = env->FindClass("java/lang/reflect/Field");
+    jclass cModifier = env->FindClass("java/lang/reflect/Modifier");
+    if (!cClass || !cField || !cModifier) { env->ExceptionClear(); return nullptr; }
+
+    jmethodID midGetFields = env->GetMethodID(cClass, "getDeclaredFields", "()[Ljava/lang/reflect/Field;");
+    jmethodID midGetSuper = env->GetMethodID(cClass, "getSuperclass", "()Ljava/lang/Class;");
+    jmethodID midFieldName = env->GetMethodID(cField, "getName", "()Ljava/lang/String;");
+    jmethodID midFieldMods = env->GetMethodID(cField, "getModifiers", "()I");
+    jmethodID midSetAcc = env->GetMethodID(cField, "setAccessible", "(Z)V");
+    jmethodID midFieldGet = env->GetMethodID(cField, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
+    jmethodID midIsStatic = env->GetStaticMethodID(cModifier, "isStatic", "(I)Z");
+    if (!midGetFields || !midGetSuper || !midFieldName || !midFieldMods || !midFieldGet || !midIsStatic) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+
+    jobject bestValue = nullptr;
+    int bestScore = 0;
+    std::string bestFieldName;
+    std::string bestTypeName;
+
+    jobject cur = env->GetObjectClass(target);
+    while (cur) {
+        jobjectArray fields = (jobjectArray)env->CallObjectMethod(cur, midGetFields);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            fields = nullptr;
+        }
+        if (fields) {
+            jsize n = env->GetArrayLength(fields);
+            for (jsize i = 0; i < n; ++i) {
+                jobject f = env->GetObjectArrayElement(fields, i);
+                if (!f) continue;
+
+                jint mods = env->CallIntMethod(f, midFieldMods);
+                jboolean isStatic = env->CallStaticBooleanMethod(cModifier, midIsStatic, mods);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    env->DeleteLocalRef(f);
+                    continue;
+                }
+                if (isStatic == JNI_TRUE) {
+                    env->DeleteLocalRef(f);
+                    continue;
+                }
+
+                jstring jn = (jstring)env->CallObjectMethod(f, midFieldName);
+                std::string fieldName = jn ? jstr(env, jn) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); fieldName.clear(); }
+                if (jn) env->DeleteLocalRef(jn);
+
+                if (midSetAcc) env->CallVoidMethod(f, midSetAcc, JNI_TRUE);
+                jobject value = env->CallObjectMethod(f, midFieldGet, target);
+                if (env->ExceptionCheck() || !value) {
+                    env->ExceptionClear();
+                    if (value) env->DeleteLocalRef(value);
+                    env->DeleteLocalRef(f);
+                    continue;
+                }
+
+                jclass valueCls = env->GetObjectClass(value);
+                int candidateScore = valueCls ? scoreFn(env, valueCls) : 0;
+                std::string typeName = valueCls ? class_name_of_class(env, valueCls) : std::string();
+                if (valueCls) env->DeleteLocalRef(valueCls);
+                if (fieldNameHintCount > 0) {
+                    int hintScore = relaxed_name_match_score(fieldName, fieldNameHints, fieldNameHintCount);
+                    if (hintScore > 0) candidateScore += hintScore / 3;
+                }
+
+                if (candidateScore >= minScore && candidateScore > bestScore) {
+                    if (bestValue) env->DeleteLocalRef(bestValue);
+                    bestValue = value;
+                    bestScore = candidateScore;
+                    bestFieldName = fieldName;
+                    bestTypeName = typeName;
+                } else {
+                    env->DeleteLocalRef(value);
+                }
+
+                env->DeleteLocalRef(f);
+            }
+            env->DeleteLocalRef(fields);
+        }
+
+        jobject next = env->CallObjectMethod(cur, midGetSuper);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            next = nullptr;
+        }
+        env->DeleteLocalRef(cur);
+        cur = next;
+    }
+
+    if (bestValue) {
+        dlog("%s: heuristic field %s (%s) score=%d", tag, bestFieldName.c_str(), bestTypeName.c_str(), bestScore);
+    }
+    return bestValue;
+}
+
+static std::string name_from_profile_object(JNIEnv* env, jobject profile, const char* tag) {
+    if (!env || !profile) return {};
+
+    jclass cGP = env->GetObjectClass(profile);
+    if (!cGP) { env->ExceptionClear(); return {}; }
+
+    jmethodID midName = env->GetMethodID(cGP, "getName", "()Ljava/lang/String;");
+    if (!midName) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(cGP);
+        return {};
+    }
+
+    jstring js = (jstring)env->CallObjectMethod(profile, midName);
+    std::string out;
+    if (!env->ExceptionCheck() && js) {
+        out = jstr(env, js);
+        env->DeleteLocalRef(js);
+        if (!out.empty()) dlog("%s: profile.getName -> '%s'", tag, out.c_str());
+    } else {
+        env->ExceptionClear();
+    }
+
+    env->DeleteLocalRef(cGP);
+    return out;
+}
+
+static jobject find_profile_object_from_holder(JNIEnv* env, jobject holder, const char* tag) {
+    if (!env || !holder) return nullptr;
+
+    jobject profile = nullptr;
+    const char* profileTypeNames[] = { "com.mojang.authlib.GameProfile" };
+    const char* profileMethodNames[] = {
+        "getProfile", "getGameProfile",
+        "func_148256_e", "func_146103_bH", "func_178845_a",
+        "cd", "e", "a"
+    };
+    const char* profileFieldHints[] = { "profile", "gameProfile", "bH", "d" };
+
+    profile = reflect_invoke_zero_arg_instance_method_object(
+        env, holder,
+        profileMethodNames, 8,
+        profileTypeNames, 1,
+        tag
+    );
+    if (profile) return profile;
+
+    profile = reflect_invoke_zero_arg_instance_method_object(
+        env, holder,
+        nullptr, 0,
+        profileTypeNames, 1,
+        tag
+    );
+    if (profile) return profile;
+
+    profile = reflect_find_best_instance_field_object_by_score(
+        env, holder,
+        profileFieldHints, 2,
+        score_game_profile_like_class, 120,
+        tag
+    );
+    return profile;
+}
+
+static void flog_holder_candidates(JNIEnv* env, jobject holder, const char* tag) {
+    if (!env || !holder || !tag) return;
+
+    jclass cClass = env->FindClass("java/lang/Class");
+    jclass cField = env->FindClass("java/lang/reflect/Field");
+    jclass cMethod = env->FindClass("java/lang/reflect/Method");
+    jclass cModifier = env->FindClass("java/lang/reflect/Modifier");
+    if (!cClass || !cField || !cMethod || !cModifier) { env->ExceptionClear(); return; }
+
+    jmethodID midGetFields = env->GetMethodID(cClass, "getDeclaredFields", "()[Ljava/lang/reflect/Field;");
+    jmethodID midGetMethods = env->GetMethodID(cClass, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;");
+    jmethodID midGetSuper = env->GetMethodID(cClass, "getSuperclass", "()Ljava/lang/Class;");
+    jmethodID midFieldName = env->GetMethodID(cField, "getName", "()Ljava/lang/String;");
+    jmethodID midFieldType = env->GetMethodID(cField, "getType", "()Ljava/lang/Class;");
+    jmethodID midMethodName = env->GetMethodID(cMethod, "getName", "()Ljava/lang/String;");
+    jmethodID midMethodRT = env->GetMethodID(cMethod, "getReturnType", "()Ljava/lang/Class;");
+    jmethodID midMethodParams = env->GetMethodID(cMethod, "getParameterTypes", "()[Ljava/lang/Class;");
+    jmethodID midMethodMods = env->GetMethodID(cMethod, "getModifiers", "()I");
+    jmethodID midIsStatic = env->GetStaticMethodID(cModifier, "isStatic", "(I)Z");
+    if (!midGetFields || !midGetMethods || !midGetSuper || !midFieldName || !midFieldType ||
+        !midMethodName || !midMethodRT || !midMethodParams || !midMethodMods || !midIsStatic) {
+        env->ExceptionClear();
+        return;
+    }
+
+    jobject cur = env->GetObjectClass(holder);
+    int depth = 0;
+    while (cur && depth < 3) {
+        std::string clsName = class_name_of_class(env, cur);
+        flog("%s: class[%d]=%s", tag, depth, clsName.empty() ? "(unknown)" : clsName.c_str());
+
+        jobjectArray methods = (jobjectArray)env->CallObjectMethod(cur, midGetMethods);
+        if (!env->ExceptionCheck() && methods) {
+            jsize n = env->GetArrayLength(methods);
+            for (jsize i = 0; i < n; ++i) {
+                jobject m = env->GetObjectArrayElement(methods, i);
+                if (!m) continue;
+
+                jint mods = env->CallIntMethod(m, midMethodMods);
+                jboolean isStatic = env->CallStaticBooleanMethod(cModifier, midIsStatic, mods);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+                if (isStatic == JNI_TRUE) {
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                jobjectArray params = (jobjectArray)env->CallObjectMethod(m, midMethodParams);
+                jsize pc = (!env->ExceptionCheck() && params) ? env->GetArrayLength(params) : -1;
+                if (env->ExceptionCheck()) { env->ExceptionClear(); pc = -1; }
+                if (pc != 0) {
+                    if (params) env->DeleteLocalRef(params);
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                jstring jn = (jstring)env->CallObjectMethod(m, midMethodName);
+                std::string methodName = jn ? jstr(env, jn) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); methodName.clear(); }
+                if (jn) env->DeleteLocalRef(jn);
+
+                jobject rt = env->CallObjectMethod(m, midMethodRT);
+                std::string rtName = (!env->ExceptionCheck() && rt) ? class_name_of_class(env, rt) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); rtName.clear(); }
+
+                if (rtName == "java.lang.String" ||
+                    contains_ci(rtName, "gameprofile") ||
+                    contains_ci(rtName, "uuid") ||
+                    contains_ci(rtName, "session") ||
+                    contains_ci(rtName, "nethandler")) {
+                    flog("%s: method %s -> %s", tag, methodName.empty() ? "(anon)" : methodName.c_str(), rtName.c_str());
+                }
+
+                if (rt) env->DeleteLocalRef(rt);
+                if (params) env->DeleteLocalRef(params);
+                env->DeleteLocalRef(m);
+            }
+            env->DeleteLocalRef(methods);
+        } else {
+            env->ExceptionClear();
+        }
+
+        jobjectArray fields = (jobjectArray)env->CallObjectMethod(cur, midGetFields);
+        if (!env->ExceptionCheck() && fields) {
+            jsize n = env->GetArrayLength(fields);
+            for (jsize i = 0; i < n; ++i) {
+                jobject f = env->GetObjectArrayElement(fields, i);
+                if (!f) continue;
+
+                jstring jn = (jstring)env->CallObjectMethod(f, midFieldName);
+                std::string fieldName = jn ? jstr(env, jn) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); fieldName.clear(); }
+                if (jn) env->DeleteLocalRef(jn);
+
+                jobject type = env->CallObjectMethod(f, midFieldType);
+                std::string typeName = (!env->ExceptionCheck() && type) ? class_name_of_class(env, type) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); typeName.clear(); }
+
+                if (typeName == "java.lang.String" ||
+                    contains_ci(typeName, "gameprofile") ||
+                    contains_ci(typeName, "uuid") ||
+                    contains_ci(typeName, "session") ||
+                    contains_ci(typeName, "nethandler")) {
+                    flog("%s: field %s : %s", tag, fieldName.empty() ? "(anon)" : fieldName.c_str(), typeName.c_str());
+                }
+
+                if (type) env->DeleteLocalRef(type);
+                env->DeleteLocalRef(f);
+            }
+            env->DeleteLocalRef(fields);
+        } else {
+            env->ExceptionClear();
+        }
+
+        jobject next = env->CallObjectMethod(cur, midGetSuper);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            next = nullptr;
+        }
+        env->DeleteLocalRef(cur);
+        cur = next;
+        ++depth;
+    }
+}
+
+static void flog_string_arg_methods(JNIEnv* env, jobject holder, const char* tag) {
+    if (!env || !holder || !tag) return;
+
+    jclass cClass = env->FindClass("java/lang/Class");
+    jclass cMethod = env->FindClass("java/lang/reflect/Method");
+    jclass cModifier = env->FindClass("java/lang/reflect/Modifier");
+    if (!cClass || !cMethod || !cModifier) { env->ExceptionClear(); return; }
+
+    jmethodID midGetMethods = env->GetMethodID(cClass, "getDeclaredMethods", "()[Ljava/lang/reflect/Method;");
+    jmethodID midGetSuper = env->GetMethodID(cClass, "getSuperclass", "()Ljava/lang/Class;");
+    jmethodID midMethodName = env->GetMethodID(cMethod, "getName", "()Ljava/lang/String;");
+    jmethodID midMethodRT = env->GetMethodID(cMethod, "getReturnType", "()Ljava/lang/Class;");
+    jmethodID midMethodParams = env->GetMethodID(cMethod, "getParameterTypes", "()[Ljava/lang/Class;");
+    jmethodID midMethodMods = env->GetMethodID(cMethod, "getModifiers", "()I");
+    jmethodID midIsStatic = env->GetStaticMethodID(cModifier, "isStatic", "(I)Z");
+    if (!midGetMethods || !midGetSuper || !midMethodName || !midMethodRT ||
+        !midMethodParams || !midMethodMods || !midIsStatic) {
+        env->ExceptionClear();
+        return;
+    }
+
+    jobject cur = env->GetObjectClass(holder);
+    int depth = 0;
+    while (cur && depth < 4) {
+        std::string clsName = class_name_of_class(env, cur);
+        flog("%s: class[%d]=%s", tag, depth, clsName.empty() ? "(unknown)" : clsName.c_str());
+
+        jobjectArray methods = (jobjectArray)env->CallObjectMethod(cur, midGetMethods);
+        if (!env->ExceptionCheck() && methods) {
+            jsize n = env->GetArrayLength(methods);
+            for (jsize i = 0; i < n; ++i) {
+                jobject m = env->GetObjectArrayElement(methods, i);
+                if (!m) continue;
+
+                jint mods = env->CallIntMethod(m, midMethodMods);
+                jboolean isStatic = env->CallStaticBooleanMethod(cModifier, midIsStatic, mods);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+                if (isStatic == JNI_TRUE) {
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                jobjectArray params = (jobjectArray)env->CallObjectMethod(m, midMethodParams);
+                jsize pc = (!env->ExceptionCheck() && params) ? env->GetArrayLength(params) : -1;
+                if (env->ExceptionCheck()) { env->ExceptionClear(); pc = -1; }
+                if (pc < 1 || pc > 2) {
+                    if (params) env->DeleteLocalRef(params);
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                std::vector<std::string> paramNames;
+                bool firstIsString = false;
+                for (jsize pi = 0; pi < pc; ++pi) {
+                    jobject p = env->GetObjectArrayElement(params, pi);
+                    std::string pn = (!env->ExceptionCheck() && p) ? class_name_of_class(env, p) : std::string();
+                    if (env->ExceptionCheck()) { env->ExceptionClear(); pn.clear(); }
+                    if (p) env->DeleteLocalRef(p);
+                    paramNames.push_back(pn);
+                }
+                if (params) env->DeleteLocalRef(params);
+                firstIsString = !paramNames.empty() && paramNames[0] == "java.lang.String";
+                if (!firstIsString) {
+                    env->DeleteLocalRef(m);
+                    continue;
+                }
+
+                jstring jn = (jstring)env->CallObjectMethod(m, midMethodName);
+                std::string methodName = jn ? jstr(env, jn) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); methodName.clear(); }
+                if (jn) env->DeleteLocalRef(jn);
+
+                jobject rt = env->CallObjectMethod(m, midMethodRT);
+                std::string rtName = (!env->ExceptionCheck() && rt) ? class_name_of_class(env, rt) : std::string();
+                if (env->ExceptionCheck()) { env->ExceptionClear(); rtName.clear(); }
+                if (rt) env->DeleteLocalRef(rt);
+
+                std::string sig = methodName.empty() ? "(anon)" : methodName;
+                sig += "(";
+                for (size_t pi = 0; pi < paramNames.size(); ++pi) {
+                    if (pi) sig += ",";
+                    sig += paramNames[pi].empty() ? "?" : paramNames[pi];
+                }
+                sig += ")";
+                flog("%s: method %s -> %s", tag, sig.c_str(), rtName.empty() ? "?" : rtName.c_str());
+
+                env->DeleteLocalRef(m);
+            }
+            env->DeleteLocalRef(methods);
+        } else {
+            env->ExceptionClear();
+        }
+
+        jobject next = env->CallObjectMethod(cur, midGetSuper);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            next = nullptr;
+        }
+        env->DeleteLocalRef(cur);
+        cur = next;
+        ++depth;
+    }
 }
 
 static jobject find_session_object(JNIEnv* env, jobject mc) {
@@ -1575,6 +2761,11 @@ static jobject find_session_object(JNIEnv* env, jobject mc) {
         const char* typeNames[] = { "net.minecraft.util.Session", "bhz" };
         session = reflect_invoke_zero_arg_instance_method_object(env, mc, methodNames, 4, typeNames, 2, "id:sessionReflectMethod");
     }
+    if (!session) {
+        const char* fieldHints[] = { "session", "minecraftSession", "accountSession" };
+        session = reflect_find_best_instance_field_object_by_score(env, mc, fieldHints, 3, score_session_like_class, 90, "id:sessionHeuristicField");
+        flog("id: session via heuristic field %s", session ? "ok" : "null");
+    }
 
     env->DeleteLocalRef(clsMc);
     return session;
@@ -1600,6 +2791,10 @@ static jobject find_player_object(JNIEnv* env, jobject mc) {
     if (!player) {
         const char* typeNames[] = { "net.minecraft.client.entity.EntityPlayerSP", "bew" };
         player = reflect_invoke_zero_arg_instance_method_object(env, mc, nullptr, 0, typeNames, 2, "mc:playerReflectMethod");
+    }
+    if (!player) {
+        const char* fieldHints[] = { "thePlayer", "player", "localPlayer", "self" };
+        player = reflect_find_best_instance_field_object_by_score(env, mc, fieldHints, 4, score_player_like_class, 95, "mc:playerHeuristicField");
     }
 
     env->DeleteLocalRef(clsMc);
@@ -1651,6 +2846,14 @@ static jobject find_net_handler_object(JNIEnv* env, jobject mc, jobject player) 
         const char* methodNames[] = { "getNetHandler", "func_147114_u" };
         const char* typeNames[] = { "net.minecraft.client.network.NetHandlerPlayClient", "bcy" };
         nh = reflect_invoke_zero_arg_instance_method_object(env, mc, methodNames, 2, typeNames, 2, "mc:nhReflectMethod");
+    }
+    if (!nh && player) {
+        const char* fieldHints[] = { "sendQueue", "netHandler", "connection", "networkHandler" };
+        nh = reflect_find_best_instance_field_object_by_score(env, player, fieldHints, 4, score_net_handler_like_class, 90, "mc:nhHeuristicField(player)");
+    }
+    if (!nh) {
+        const char* fieldHints[] = { "netHandler", "sendQueue", "connection", "networkHandler" };
+        nh = reflect_find_best_instance_field_object_by_score(env, mc, fieldHints, 4, score_net_handler_like_class, 90, "mc:nhHeuristicField(mc)");
     }
     return nh;
 }
@@ -2114,6 +3317,17 @@ static std::string get_self_name(JNIEnv* env, jobject mc) {
                 } else env->ExceptionClear();
             }
         }
+        if (name.empty()) {
+            jobject gp = find_profile_object_from_holder(env, session, "id:sessProfileReflect");
+            if (gp) {
+                name = name_from_profile_object(env, gp, "id:sessProfileReflect");
+                if (!name.empty()) flog("id: session.profileReflect.getName -> '%s'", name.c_str());
+                env->DeleteLocalRef(gp);
+            }
+        }
+        if (name.empty()) {
+            flog_holder_candidates(env, session, "id:sessDiag");
+        }
         env->DeleteLocalRef(cSess);
         env->DeleteLocalRef(session);
     }
@@ -2131,6 +3345,10 @@ static std::string get_self_name(JNIEnv* env, jobject mc) {
                 jmethodID midNm = tryMethod(env, cPl, {
                     {"getName",                "()Ljava/lang/String;"},
                     {"getCommandSenderName",   "()Ljava/lang/String;"},
+                    {"getNameClear",           "()Ljava/lang/String;"},
+                    {"w",                      "()Ljava/lang/String;"},
+                    {"l",                      "()Ljava/lang/String;"},
+                    {"P",                      "()Ljava/lang/String;"},
                 }, "id:playerName");
                 if (midNm) {
                     jstring js = (jstring)env->CallObjectMethod(player, midNm);
@@ -2143,6 +3361,7 @@ static std::string get_self_name(JNIEnv* env, jobject mc) {
                     jmethodID midGP = tryMethod(env, cPl, {
                         {"getGameProfile", "()Lcom/mojang/authlib/GameProfile;"},
                         {"func_146103_bH", "()Lcom/mojang/authlib/GameProfile;"},
+                        {"cd",             "()Lcom/mojang/authlib/GameProfile;"},
                     }, "id:playerGP");
                     if (midGP) {
                         jobject gp = env->CallObjectMethod(player, midGP);
@@ -2158,6 +3377,30 @@ static std::string get_self_name(JNIEnv* env, jobject mc) {
                         } else env->ExceptionClear();
                     }
                 }
+                if (name.empty()) {
+                    jfieldID fidName = env->GetFieldID(cPl, "nameClear", "Ljava/lang/String;");
+                    if (!fidName) { env->ExceptionClear(); fidName = env->GetFieldID(cPl, "bT", "Ljava/lang/String;"); }
+                    if (fidName) {
+                        jstring js = (jstring)env->GetObjectField(player, fidName);
+                        if (!env->ExceptionCheck() && js) {
+                            name = jstr(env, js);
+                            env->DeleteLocalRef(js);
+                            dlog("id: player.nameField -> '%s'", name.c_str());
+                            flog("id: player.nameField -> '%s'", name.c_str());
+                        } else env->ExceptionClear();
+                    }
+                }
+                if (name.empty()) {
+                    jobject gp = find_profile_object_from_holder(env, player, "id:playerGPReflectDirect");
+                    if (gp) {
+                        name = name_from_profile_object(env, gp, "id:playerGPReflectDirect");
+                        if (!name.empty()) flog("id: player.profileReflect.getName -> '%s'", name.c_str());
+                        env->DeleteLocalRef(gp);
+                    }
+                }
+                if (name.empty()) {
+                    flog_holder_candidates(env, player, "id:playerDiagDirect");
+                }
 
                 env->DeleteLocalRef(cPl);
                 env->DeleteLocalRef(player);
@@ -2172,6 +3415,10 @@ static std::string get_self_name(JNIEnv* env, jobject mc) {
             jmethodID midNm = tryMethod(env, cPl, {
                 {"getName",                "()Ljava/lang/String;"},
                 {"getCommandSenderName",   "()Ljava/lang/String;"},
+                {"getNameClear",           "()Ljava/lang/String;"},
+                {"w",                      "()Ljava/lang/String;"},
+                {"l",                      "()Ljava/lang/String;"},
+                {"P",                      "()Ljava/lang/String;"},
             }, "id:playerNameReflect");
             if (midNm) {
                 jstring js = (jstring)env->CallObjectMethod(player, midNm);
@@ -2187,6 +3434,7 @@ static std::string get_self_name(JNIEnv* env, jobject mc) {
                 jmethodID midGP = tryMethod(env, cPl, {
                     {"getGameProfile", "()Lcom/mojang/authlib/GameProfile;"},
                     {"func_146103_bH", "()Lcom/mojang/authlib/GameProfile;"},
+                    {"cd",             "()Lcom/mojang/authlib/GameProfile;"},
                 }, "id:playerGPReflect");
                 if (midGP) {
                     jobject gp = env->CallObjectMethod(player, midGP);
@@ -2206,6 +3454,30 @@ static std::string get_self_name(JNIEnv* env, jobject mc) {
                     } else env->ExceptionClear();
                 }
             }
+            if (name.empty()) {
+                jfieldID fidName = env->GetFieldID(cPl, "nameClear", "Ljava/lang/String;");
+                if (!fidName) { env->ExceptionClear(); fidName = env->GetFieldID(cPl, "bT", "Ljava/lang/String;"); }
+                if (fidName) {
+                    jstring js = (jstring)env->GetObjectField(player, fidName);
+                    if (!env->ExceptionCheck() && js) {
+                        name = jstr(env, js);
+                        env->DeleteLocalRef(js);
+                        dlog("id: reflected player.nameField -> '%s'", name.c_str());
+                        flog("id: reflected player.nameField -> '%s'", name.c_str());
+                    } else env->ExceptionClear();
+                }
+            }
+            if (name.empty()) {
+                jobject gp = find_profile_object_from_holder(env, player, "id:playerGPReflect2");
+                if (gp) {
+                    name = name_from_profile_object(env, gp, "id:playerGPReflect2");
+                    if (!name.empty()) flog("id: reflected player.profileReflect.getName -> '%s'", name.c_str());
+                    env->DeleteLocalRef(gp);
+                }
+            }
+            if (name.empty()) {
+                flog_holder_candidates(env, player, "id:playerDiagReflect");
+            }
 
             env->DeleteLocalRef(cPl);
             env->DeleteLocalRef(player);
@@ -2223,6 +3495,7 @@ static std::string get_self_name(JNIEnv* env, jobject mc) {
             jmethodID midGP = tryMethod(env, cPl, {
                 {"getGameProfile", "()Lcom/mojang/authlib/GameProfile;"},
                 {"func_146103_bH", "()Lcom/mojang/authlib/GameProfile;"},
+                {"cd",             "()Lcom/mojang/authlib/GameProfile;"},
             }, "id:playerGP2");
             if (midGP) {
                 myGP = env->CallObjectMethod(player, midGP);
@@ -2230,9 +3503,16 @@ static std::string get_self_name(JNIEnv* env, jobject mc) {
             }
             env->DeleteLocalRef(cPl);
         }
+        if (!myGP && player) {
+            myGP = find_profile_object_from_holder(env, player, "id:playerGP2Reflect");
+        }
         // Obtain NetHandler
         jobject nh = find_net_handler_object(env, mc, player);
-        if (nh && myGP) {
+        if (!myGP && player) {
+            flog_holder_candidates(env, player, "id:playerDiagUUID");
+        }
+        if (nh) {
+            flog_holder_candidates(env, nh, "id:nhDiag");
             jclass cNH = env->GetObjectClass(nh);
             // Direct method first: NetHandlerPlayClient.getPlayerInfo(UUID)
             if (name.empty()) {
@@ -2706,6 +3986,49 @@ static void handle_line(const char* line, SOCKET c) {
         return;
     }
 
+    if (_stricmp(line, "chatdiag") == 0) {
+        if (JNIEnv* env = get_env()) {
+            JniLocalFrame frame(env, 256);
+            jobject mc = get_minecraft_singleton(env);
+            jobject player = mc ? find_player_object(env, mc) : nullptr;
+            jobject nh = (mc && player) ? find_net_handler_object(env, mc, player) : nullptr;
+            if (mc) flog_string_arg_methods(env, mc, "chat:mcStringDiag");
+            if (player) flog_string_arg_methods(env, player, "chat:playerStringDiag");
+            if (nh) flog_string_arg_methods(env, nh, "chat:nhStringDiag");
+            send_line(c, "ok", true);
+        }
+        return;
+    }
+
+    if (_strnicmp(line, "callstr ", 8) == 0) {
+        const char* rest = line + 8;
+        const char* sp1 = strchr(rest, ' ');
+        const char* sp2 = sp1 ? strchr(sp1 + 1, ' ') : nullptr;
+        if (!sp1 || !sp2) {
+            send_line(c, "ng", true);
+            return;
+        }
+
+        std::string target(rest, sp1 - rest);
+        std::string method(sp1 + 1, sp2 - (sp1 + 1));
+        std::string payload(sp2 + 1);
+        bool ok = false;
+
+        if (JNIEnv* env = get_env()) {
+            JniLocalFrame frame(env, 256);
+            jobject mc = get_minecraft_singleton(env);
+            jobject player = mc ? find_player_object(env, mc) : nullptr;
+            jobject nh = (mc && player) ? find_net_handler_object(env, mc, player) : nullptr;
+
+            if (target == "mc" && mc) ok = invoke_named_string_method(env, mc, method.c_str(), payload, "callstr:mc");
+            else if (target == "player" && player) ok = invoke_named_string_method(env, player, method.c_str(), payload, "callstr:player");
+            else if (target == "nh" && nh) ok = invoke_named_string_method(env, nh, method.c_str(), payload, "callstr:nh");
+        }
+
+        send_line(c, ok ? "ok" : "ng", true);
+        return;
+    }
+
     send_line(c, "unknown", true);
 }
 
@@ -2752,8 +4075,8 @@ flog("BUS: connected to %s:%d", BUS_HOST, port);
 
         // プロセスID付きで挨拶
         DWORD pid = GetCurrentProcessId();
-        char greet[64];
-        _snprintf_s(greet, _TRUNCATE, "hello %lu", (unsigned long)pid);
+        char greet[96];
+        _snprintf_s(greet, _TRUNCATE, "hello %lu %s", (unsigned long)pid, AGENT_TAG);
         send_line(c, greet, false);
         flog("BUS: sent %s", greet);
 

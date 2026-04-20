@@ -492,15 +492,8 @@ class ElectronOverlayBackend {
   }
 
   findDllPath() {
-    const candidates = [
-      resolveRoot(this.rootDir, "build", "util8b.dll"),
-      resolveRoot(this.rootDir, "build", "util8.dll"),
-      resolveRoot(this.rootDir, "build", "util7.dll"),
-      resolveRoot(this.rootDir, "build", "util.dll"),
-      resolveRoot(this.rootDir, "util.dll")
-    ];
-
-    return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+    const dllPath = resolveRoot(this.rootDir, "util.dll");
+    return fs.existsSync(dllPath) ? dllPath : null;
   }
 
   findInjectorPath() {

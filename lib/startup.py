@@ -33,6 +33,7 @@ def check_inject(self):
                         self.status.set_log(f"injected")
                         self.status.injected = True
                     else:
+                        self.status.set_log("injected (id pending)")
                         # If ID not resolved, allow re-sending chat test on next loop
                         self.status.test_chat_sent = False
                     #ext.send("score")

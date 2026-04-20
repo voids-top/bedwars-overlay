@@ -31,6 +31,10 @@
         "to": "Minecraftia.ttf"
       },
       {
+        "from": "../AgentRunnable.class",
+        "to": "AgentRunnable.class"
+      },
+      {
         "from": "../injector.exe",
         "to": "injector.exe"
       },
@@ -44,8 +48,7 @@
         "filter": [
           "util.dll",
           "util7.dll",
-          "util8.dll",
-          "util8b.dll"
+          "util8.dll"
         ]
       }
     ],
