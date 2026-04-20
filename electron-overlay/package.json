@@ -9,8 +9,9 @@
     "start": "electron .",
     "dev": "electron .",
     "build:standalone": "electron-builder --win dir --x64",
-    "build:onefile": "electron-builder --win portable --x64",
-    "build:local": "npm run build:standalone && npm run build:onefile"
+    "build:archive": "electron-builder --win zip --x64",
+    "build:portable": "electron-builder --win portable --x64",
+    "build:local": "electron-builder --win dir zip --x64"
   },
   "build": {
     "appId": "dev.voidpro.void-overlay-electron",
@@ -53,7 +54,7 @@
       }
     ],
     "win": {
-      "artifactName": "overlay-electron.exe"
+      "artifactName": "overlay-electron.${ext}"
     }
   },
   "dependencies": {

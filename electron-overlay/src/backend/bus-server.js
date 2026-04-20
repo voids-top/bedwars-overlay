@@ -72,21 +72,24 @@ class BusServer {
     socket._helloDone = true;
     socket._helloBuffer = "";
 
-    const match = /^hello\s+(\d+)$/i.exec(line.trim());
+    const match = /^hello\s+(\d+)(?:\s+(.+))?$/i.exec(line.trim());
     if (!match) {
       socket.destroy();
       return;
     }
 
     const pid = Number(match[1]);
+    const agentTag = match[2]?.trim() || null;
     const existing = this.sessions.get(pid);
     if (existing) {
       existing.socket.destroy();
     }
 
     socket._pid = pid;
+    socket._agentTag = agentTag;
     this.sessions.set(pid, {
       pid,
+      agentTag,
       socket,
       connectedAt: Date.now()
     });

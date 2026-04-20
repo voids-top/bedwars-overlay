@@ -19,7 +19,17 @@ npm install
 npm start
 ```
 
+## Build
+
+```powershell
+npm run build:local
+```
+
+- `build:local` builds `win-unpacked` and a `.zip` archive for distribution.
+- `build:portable` remains available for comparison, but it is not the default distribution target.
+
 ## Notes
 
 - This version focuses on the overlay, bus, injection, and stats flow.
 - It reuses assets and native binaries from the repository root.
+- The portable target extracts resources to a temp directory at launch, so startup is noticeably slower than `win-unpacked`.
