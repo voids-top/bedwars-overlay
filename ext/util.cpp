@@ -188,6 +188,11 @@ static jmethodID tryMethod(JNIEnv* env, jclass cls,
 static jobject find_session_object(JNIEnv* env, jobject mc);
 static jobject find_player_object(JNIEnv* env, jobject mc);
 static jobject find_net_handler_object(JNIEnv* env, jobject mc, jobject player);
+static jclass forName(JNIEnv* env, const char* dot, jobject loader);
+static jobject reflect_invoke_zero_arg_instance_method_object(JNIEnv* env, jobject target,
+                                                              const char* const* methodNames, size_t methodNameCount,
+                                                              const char* const* returnTypeNames, size_t returnTypeCount,
+                                                              const char* tag);
 
 static std::string ascii_only(const std::string& in) {
     std::string out; out.reserve(in.size());
@@ -220,6 +225,51 @@ static jobject getSysCL(JNIEnv* env) {
     if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
     return cl;
 }
+static jobject getLaunchWrapperCL(JNIEnv* env) {
+    if (!env) return nullptr;
+
+    jobject tccl = getTCCL(env);
+    jobject syscl = getSysCL(env);
+    const struct {
+        const char* slash;
+        const char* dot;
+    } cands[] = {
+        {"net/minecraft/launchwrapper/Launch", "net.minecraft.launchwrapper.Launch"},
+    };
+
+    for (const auto& cand : cands) {
+        jclass cls = env->FindClass(cand.slash);
+        if (!cls) {
+            env->ExceptionClear();
+            if (tccl) cls = forName(env, cand.dot, tccl);
+            if (!cls && syscl) cls = forName(env, cand.dot, syscl);
+        }
+        if (!cls) continue;
+
+        jfieldID fid = env->GetStaticFieldID(cls, "classLoader", "Lnet/minecraft/launchwrapper/LaunchClassLoader;");
+        if (!fid) {
+            env->ExceptionClear();
+            env->DeleteLocalRef(cls);
+            continue;
+        }
+
+        jobject loader = env->GetStaticObjectField(cls, fid);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            loader = nullptr;
+        }
+        env->DeleteLocalRef(cls);
+        if (loader) {
+            if (tccl) env->DeleteLocalRef(tccl);
+            if (syscl) env->DeleteLocalRef(syscl);
+            return loader;
+        }
+    }
+
+    if (tccl) env->DeleteLocalRef(tccl);
+    if (syscl) env->DeleteLocalRef(syscl);
+    return nullptr;
+}
 static jclass forName(JNIEnv* env, const char* dot, jobject loader) {
     jclass cClass = env->FindClass("java/lang/Class");
     if (!cClass) { env->ExceptionClear(); return nullptr; }
@@ -240,6 +290,10 @@ static void collect_loaders(JNIEnv* env, std::vector<jobject>& out) {
     };
     add(getTCCL(env));
     add(getSysCL(env));
+    if (jobject launchCl = getLaunchWrapperCL(env)) {
+        add(launchCl);
+        env->DeleteLocalRef(launchCl);
+    }
 
     jclass cThread = env->FindClass("java/lang/Thread");
     if (!cThread) { env->ExceptionClear(); return; }
@@ -1152,10 +1206,10 @@ static jclass find_mc_class(JNIEnv* env) {
         jclass c = env->FindClass(n[0]=='n' ? "net/minecraft/client/Minecraft" : n);
         if (c) { dlog("step0: FindClass hit: %s", n); cache_mc_class(env, c); for (auto g: loaders) env->DeleteGlobalRef(g); return c; }
         env->ExceptionClear();
-    }
-    for (auto n: candidates) for (auto cl: loaders) {
-        jclass c = forName(env, n, cl);
-        if (c) { dlog("step0: class loaded by some loader: %s", n); cache_mc_class(env, c); for (auto g: loaders) env->DeleteGlobalRef(g); return c; }
+        for (auto cl: loaders) {
+            c = forName(env, n, cl);
+            if (c) { dlog("step0: class loaded by some loader: %s", n); cache_mc_class(env, c); for (auto g: loaders) env->DeleteGlobalRef(g); return c; }
+        }
     }
     for (auto g: loaders) env->DeleteGlobalRef(g);
 
@@ -1168,9 +1222,91 @@ static jclass find_mc_class(JNIEnv* env) {
     dlog("step0: class lookup fallback exhausted");
     return nullptr;
 }
+
+static jobject get_minecraft_singleton_via_forge(JNIEnv* env) {
+    if (!env) return nullptr;
+
+    const struct HandlerCandidate {
+        const char* dot;
+        const char* slash;
+        const char* instanceSig;
+    } handlers[] = {
+        {
+            "net.minecraftforge.fml.client.FMLClientHandler",
+            "net/minecraftforge/fml/client/FMLClientHandler",
+            "()Lnet/minecraftforge/fml/client/FMLClientHandler;"
+        },
+        {
+            "cpw.mods.fml.client.FMLClientHandler",
+            "cpw/mods/fml/client/FMLClientHandler",
+            "()Lcpw/mods/fml/client/FMLClientHandler;"
+        },
+    };
+
+    const char* clientMethodNames[] = { "getClient", "getMinecraft", "client" };
+    const char* mcTypeNames[] = { "net.minecraft.client.Minecraft", "ave", "bsu" };
+
+    std::vector<jobject> loaders;
+    collect_loaders(env, loaders);
+
+    for (const auto& handlerCand : handlers) {
+        jclass handlerCls = env->FindClass(handlerCand.slash);
+        if (!handlerCls) {
+            env->ExceptionClear();
+            for (auto cl : loaders) {
+                handlerCls = forName(env, handlerCand.dot, cl);
+                if (handlerCls) break;
+            }
+        }
+        if (!handlerCls) continue;
+
+        jmethodID midInstance = env->GetStaticMethodID(handlerCls, "instance", handlerCand.instanceSig);
+        if (!midInstance) {
+            env->ExceptionClear();
+            env->DeleteLocalRef(handlerCls);
+            continue;
+        }
+
+        jobject handler = env->CallStaticObjectMethod(handlerCls, midInstance);
+        if (env->ExceptionCheck() || !handler) {
+            env->ExceptionClear();
+            env->DeleteLocalRef(handlerCls);
+            continue;
+        }
+
+        jobject mc = reflect_invoke_zero_arg_instance_method_object(
+            env,
+            handler,
+            clientMethodNames,
+            sizeof(clientMethodNames) / sizeof(clientMethodNames[0]),
+            mcTypeNames,
+            sizeof(mcTypeNames) / sizeof(mcTypeNames[0]),
+            "step0:forgeClient");
+        env->DeleteLocalRef(handler);
+        env->DeleteLocalRef(handlerCls);
+        if (mc) {
+            jclass mcCls = env->GetObjectClass(mc);
+            if (mcCls) {
+                cache_mc_class(env, mcCls);
+                env->DeleteLocalRef(mcCls);
+            } else {
+                env->ExceptionClear();
+            }
+            for (auto g : loaders) env->DeleteGlobalRef(g);
+            flog("step0: forge singleton fallback ok");
+            return mc;
+        }
+    }
+
+    for (auto g : loaders) env->DeleteGlobalRef(g);
+    return nullptr;
+}
+
 static jobject get_minecraft_singleton(JNIEnv* env) {
     jclass mc = find_mc_class(env);
     if (!mc) {
+        jobject forgeMc = get_minecraft_singleton_via_forge(env);
+        if (forgeMc) return forgeMc;
         dlog("step0 NG: Minecraft class not found");
         return nullptr;
     }
@@ -1180,8 +1316,11 @@ static jobject get_minecraft_singleton(JNIEnv* env) {
         {"getMinecraft","()Lnet/minecraft/client/Minecraft;"},
         {"getMinecraft","()Ljava/lang/Object;"},
         {"func_71410_x","()Lnet/minecraft/client/Minecraft;"},
+        {"func_71410_x","()Lave;"},
+        {"func_71410_x","()Lbsu;"},
         {"func_71410_x","()Ljava/lang/Object;"},
         {"S","()Lave;"},
+        {"S","()Lbsu;"},
         {"S","()Ljava/lang/Object;"},
     };
     for (auto& m : methods) {
@@ -1371,6 +1510,9 @@ static jobject get_minecraft_singleton(JNIEnv* env) {
         }
     }
 
+    if (jobject forgeMc = get_minecraft_singleton_via_forge(env)) {
+        return forgeMc;
+    }
     dlog("step0 NG: no static method/field yielded instance (even reflected)");
     return nullptr;
 }
@@ -1393,6 +1535,80 @@ static void send_line(SOCKET c, const char* s, bool with_nul=false) {
 
 static void send_line(SOCKET c, const std::string& s, bool with_nul) {
     send_line(c, s.c_str(), with_nul);
+}
+
+static std::string loader_diag_summary(JNIEnv* env) {
+    if (!env) return "env=null";
+
+    std::string out;
+    auto append = [&](const std::string& s) {
+        if (!out.empty()) out += "\n";
+        out += s;
+    };
+
+    if (jobject tccl = getTCCL(env)) {
+        jclass cls = env->GetObjectClass(tccl);
+        append(std::string("tccl=") + (cls ? class_name_of_class(env, cls) : "(null)"));
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteLocalRef(tccl);
+    } else {
+        append("tccl=(null)");
+    }
+
+    if (jobject syscl = getSysCL(env)) {
+        jclass cls = env->GetObjectClass(syscl);
+        append(std::string("syscl=") + (cls ? class_name_of_class(env, cls) : "(null)"));
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteLocalRef(syscl);
+    } else {
+        append("syscl=(null)");
+    }
+
+    if (jobject launchcl = getLaunchWrapperCL(env)) {
+        jclass cls = env->GetObjectClass(launchcl);
+        append(std::string("launchcl=") + (cls ? class_name_of_class(env, cls) : "(null)"));
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteLocalRef(launchcl);
+    } else {
+        append("launchcl=(null)");
+    }
+
+    const struct Target {
+        const char* dot;
+        const char* slash;
+    } targets[] = {
+        {"net.minecraft.launchwrapper.Launch", "net/minecraft/launchwrapper/Launch"},
+        {"net.minecraftforge.fml.client.FMLClientHandler", "net/minecraftforge/fml/client/FMLClientHandler"},
+        {"cpw.mods.fml.client.FMLClientHandler", "cpw/mods/fml/client/FMLClientHandler"},
+        {"net.minecraft.client.Minecraft", "net/minecraft/client/Minecraft"},
+        {"ave", "ave"},
+    };
+
+    std::vector<jobject> loaders;
+    collect_loaders(env, loaders);
+    append(std::string("loaderCount=") + std::to_string(loaders.size()));
+
+    for (const auto& target : targets) {
+        std::string line = target.dot;
+        line += " find=";
+        jclass cls = env->FindClass(target.slash);
+        line += cls ? "1" : "0";
+        if (cls) env->DeleteLocalRef(cls);
+        else env->ExceptionClear();
+
+        for (size_t i = 0; i < loaders.size() && i < 6; ++i) {
+            cls = forName(env, target.dot, loaders[i]);
+            line += " l";
+            line += std::to_string(i);
+            line += "=";
+            line += cls ? "1" : "0";
+            if (cls) env->DeleteLocalRef(cls);
+        }
+        append(line);
+    }
+
+    for (auto g : loaders) env->DeleteGlobalRef(g);
+    return out;
 }
 
 static jobject make_chat_packet(JNIEnv* env, jclass cC01, jstring jmsg) {
@@ -1455,41 +1671,6 @@ static bool send_chat_now(JNIEnv* env, jobject mc, const char* text) {
         std::string msgLog = ascii_only(msg);
         dlog("chat: request='%s'", msgLog.c_str());
         flog("chat: request(now)='%s'", msgLog.c_str());
-    }
-
-    // Targeted Badlion probe: invoke the discovered player.e(String) on the main thread only.
-    {
-        jobject player = find_player_object(env, mc);
-        if (!player) {
-            flog("chat:e5 player not found");
-            return false;
-        }
-        jclass clsPl = env->GetObjectClass(player);
-        if (!clsPl) {
-            env->ExceptionClear();
-            flog("chat:e5 no player class");
-            return false;
-        }
-        jmethodID midChat = env->GetMethodID(clsPl, "e", "(Ljava/lang/String;)V");
-        if (!midChat) {
-            env->ExceptionClear();
-            flog("chat:e5 method e(String) not found");
-            env->DeleteLocalRef(clsPl);
-            return false;
-        }
-        jstring jmsg = env->NewStringUTF(msg.c_str());
-        env->CallVoidMethod(player, midChat, jmsg);
-        bool ok = !env->ExceptionCheck();
-        if (!ok) {
-            env->ExceptionDescribe();
-            env->ExceptionClear();
-            flog("chat:e5 invoke failed");
-        } else {
-            flog("chat:e5 invoke ok");
-        }
-        env->DeleteLocalRef(jmsg);
-        env->DeleteLocalRef(clsPl);
-        return ok;
     }
 
     jclass clsMc = env->GetObjectClass(mc);
@@ -1727,14 +1908,11 @@ static bool send_chat_now(JNIEnv* env, jobject mc, const char* text) {
 
     jobject player = find_player_object(env, mc);
     if (!player) { dlog("chat: player null"); return false; }
-    bool directPreferredOk = false;
-
-    // Prefer EntityPlayerSP.sendChatMessage on Badlion.
+    // Badlion-specific fallback: some builds expose player.e(String).
     {
         jclass clsPl = env->GetObjectClass(player);
         if (!clsPl) { env->ExceptionClear(); dlog("chat: no player class"); return false; }
-        jmethodID midChat = env->GetMethodID(clsPl, "sendChatMessage", "(Ljava/lang/String;)V");
-        if (!midChat) { env->ExceptionClear(); midChat = env->GetMethodID(clsPl, "a", "(Ljava/lang/String;)V"); }
+        jmethodID midChat = env->GetMethodID(clsPl, "e", "(Ljava/lang/String;)V");
         if (midChat) {
             jstring jmsg = env->NewStringUTF(msg.c_str());
             env->CallVoidMethod(player, midChat, jmsg);
@@ -1742,17 +1920,17 @@ static bool send_chat_now(JNIEnv* env, jobject mc, const char* text) {
             if (!ok) {
                 env->ExceptionDescribe();
                 env->ExceptionClear();
-                dlog("chat: direct path threw; falling back to packet path");
+                flog("chat:e5 invoke failed");
+            } else {
+                flog("chat:e5 invoke ok");
             }
             env->DeleteLocalRef(jmsg);
             env->DeleteLocalRef(clsPl);
             if (ok) {
-                dlog("chat direct path preferred invoked; continuing to packet verification");
-                flog("chat direct path preferred invoked; continuing to packet verification");
-                directPreferredOk = true;
+                return true;
             }
         } else {
-            dlog("chat: direct method not found; trying packet path");
+            env->ExceptionClear();
             env->DeleteLocalRef(clsPl);
         }
     }
@@ -1995,26 +2173,57 @@ static bool send_chat_now(JNIEnv* env, jobject mc, const char* text) {
         env->DeleteLocalRef(cPl);
     } while (0);
 
-    if (directPreferredOk) {
-        flog("chat: direct preferred returned without a verified packet path");
-        return false;
-    }
+    // Packet probing can leave a pending JNI exception on clients where the packet path
+    // is inaccessible. Clear it before trying the direct chat methods.
+    if (env->ExceptionCheck()) env->ExceptionClear();
 
-    // Fallback: call EntityPlayerSP.sendChatMessage directly (vanilla/Lunar etc.)
+    // Fallback: call direct player chat methods (vanilla/Lunar/Forge etc.)
     {
         jclass clsPl = env->GetObjectClass(player);
         if (!clsPl) { env->ExceptionClear(); dlog("chat: no player class"); return false; }
-        jmethodID midChat = env->GetMethodID(clsPl, "sendChatMessage", "(Ljava/lang/String;)V");
-        if (!midChat) { env->ExceptionClear(); midChat = env->GetMethodID(clsPl, "a", "(Ljava/lang/String;)V"); }
-        if (!midChat) { dlog("chat: sendChatMessage not found"); env->DeleteLocalRef(clsPl); return false; }
-        jstring jmsg = env->NewStringUTF(msg.c_str());
-        env->CallVoidMethod(player, midChat, jmsg);
-        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); env->DeleteLocalRef(jmsg); env->DeleteLocalRef(clsPl); dlog("chat: direct path failed"); return false; }
-        env->DeleteLocalRef(jmsg);
+
+        struct DirectMethod {
+            const char* name;
+            bool slashOnly;
+            const char* tag;
+        };
+        const DirectMethod methods[] = {
+            {"bridge$sendCommand",     true,  "bridge$sendCommand"},
+            {"sendChatMessage",        false, "sendChatMessage"},
+            {"bridge$sendChatMessage", false, "bridge$sendChatMessage"},
+            {"a",                      false, "a"},
+        };
+
+        for (const auto& method : methods) {
+            if (method.slashOnly && (msg.empty() || msg[0] != '/')) continue;
+
+            jmethodID midChat = env->GetMethodID(clsPl, method.name, "(Ljava/lang/String;)V");
+            if (!midChat) {
+                env->ExceptionClear();
+                continue;
+            }
+
+            jstring jmsg = env->NewStringUTF(msg.c_str());
+            env->CallVoidMethod(player, midChat, jmsg);
+            bool ok = !env->ExceptionCheck();
+            if (!ok) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                env->DeleteLocalRef(jmsg);
+                dlog("chat: direct path %s failed", method.tag);
+                continue;
+            }
+
+            env->DeleteLocalRef(jmsg);
+            env->DeleteLocalRef(clsPl);
+            dlog("chat sent (direct path:%s)", method.tag);
+            flog("chat sent (direct path:%s)", method.tag);
+            return true;
+        }
+
         env->DeleteLocalRef(clsPl);
-        dlog("chat sent (direct path)");
-        flog("chat sent (direct path)");
-        return true;
+        dlog("chat: direct path not found");
+        return false;
     }
 }
 
@@ -3982,6 +4191,14 @@ static void handle_line(const char* line, SOCKET c) {
                 if (nm.empty()) send_line(c, "id: (unknown)", true);
                 else            send_line(c, std::string("id: ") + nm, true);
             }
+        }
+        return;
+    }
+
+    if (_stricmp(line, "mcdiag") == 0) {
+        if (JNIEnv* env = get_env()) {
+            JniLocalFrame frame(env, 256);
+            send_line(c, loader_diag_summary(env), true);
         }
         return;
     }
