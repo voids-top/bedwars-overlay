@@ -5,6 +5,7 @@ const BUS_PORTS = [46012, 46011, 46001];
 const VERSION = "0.2.1";
 const DEFAULT_CONFIG = {
   hypixel_key: null,
+  urchin_key: null,
   antisniper_key: null,
   refresh: 100,
   mode: "bedwars",

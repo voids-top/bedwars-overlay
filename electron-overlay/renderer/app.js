@@ -789,7 +789,7 @@ function drawSettingsMode() {
   drawLine(299, 100, 451, 100, "#FFFFFF", 3);
   drawText("Custom Logfile", 125, 285, { align: "center", size: 8, color: "#FFFFFF" });
   drawText("Mode", 125, 265, { align: "center", size: 8, color: "#FFFFFF" });
-  drawText("Reset API Key", 125, 305, { align: "center", size: 8, color: "#FFFFFF" });
+  drawText("Set API Key", 125, 305, { align: "center", size: 8, color: "#FFFFFF" });
 
   for (const [, label, y] of TOGGLE_ITEMS) {
     drawText(label, 125, y, { align: "center", size: 8, color: "#FFFFFF" });
@@ -806,7 +806,7 @@ function drawSettingsMode() {
     drawToggleState(Boolean(config[key]), y);
   }
 
-  drawRectOutline(280, 305, 52, 16, "Hypixel", COLORS.disabled);
+  drawRectOutline(280, 305, 52, 16, "Urchin");
   drawRectOutline(370, 305, 70, 16, "Antisniper");
   drawRectOutline(325, 285, 52, 16, "Change");
 
@@ -994,10 +994,21 @@ async function handleSettingsEvent(type, point) {
     }
 
     if (point.y >= 297 && point.y <= 313) {
+      if (point.x >= 255 && point.x <= 305) {
+        const question = await window.overlayAPI.promptText({
+          title: "Urchin API Key",
+          label: "Enter your Urchin API key. Leave blank to disable Urchin tags. See docs.urchin.ws",
+          value: currentConfig().urchin_key || ""
+        });
+        if (question !== null) {
+          await applyConfigPatch({ urchin_key: question || null });
+        }
+        return;
+      }
       if (point.x >= 335 && point.x <= 405) {
         const question = await window.overlayAPI.promptText({
           title: "AntiSniper API Key",
-          label: "Enter your AntiSniper API key",
+          label: "Enter your AntiSniper API key. Leave blank to disable AntiSniper",
           value: currentConfig().antisniper_key || ""
         });
         if (question !== null) {

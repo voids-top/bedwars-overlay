@@ -3,6 +3,7 @@ class StatsService {
     this.dataCache = new Map();
     this.mcidCache = new Map();
     this.inFlight = new Map();
+    this.urchinCache = new Map();
   }
 
   async lookupPlayer(mcid, { config, custom = false, nick = null } = {}) {
@@ -22,7 +23,10 @@ class StatsService {
     let queryValue = mcid;
     const cached = this.dataCache.get(mcid.toLowerCase());
     if (cached && cached.lastUpdate > Date.now() - 60000) {
-      const parsed = this.parseBedwars(cached.payload, nick, custom);
+      const parsed = await this.attachUrchinTags(this.parseBedwars(cached.payload, nick, custom), cached.payload, {
+        config,
+        custom
+      });
       return this.resolveHiddenWinstreak(parsed, mcid, config);
     }
 
@@ -57,7 +61,10 @@ class StatsService {
           lastUpdate: Date.now(),
           payload: data
         });
-        const parsed = this.parseBedwars(data, nick, custom);
+        const parsed = await this.attachUrchinTags(this.parseBedwars(data, nick, custom), data, {
+          config,
+          custom
+        });
         return this.resolveHiddenWinstreak(parsed, mcid, config);
       }
       return { status: "Nicked", data: {} };
@@ -144,6 +151,97 @@ class StatsService {
       return player.newPackageRank;
     }
     return "DEFAULT";
+  }
+
+  splitTags(value) {
+    if (!value) {
+      return [];
+    }
+    return String(value)
+      .split(",")
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+  }
+
+  mergeTags(...groups) {
+    const tags = [];
+    const seen = new Set();
+    for (const group of groups) {
+      for (const tag of group) {
+        const normalized = String(tag).toLowerCase();
+        if (seen.has(normalized)) {
+          continue;
+        }
+        seen.add(normalized);
+        tags.push(tag);
+      }
+    }
+    return tags.join(", ");
+  }
+
+  async fetchUrchinTags(player, { config, custom = false } = {}) {
+    const apiKey = config?.urchin_key;
+    const playerId = player?.uuid;
+    const playerName = player?.displayname;
+    if (!apiKey || !playerId || !playerName) {
+      return [];
+    }
+
+    const source = custom ? "MANUAL" : "GAME";
+    const cacheKey = `${String(playerId).toLowerCase()}:${source}:${apiKey}`;
+    const cached = this.urchinCache.get(cacheKey);
+    if (cached && cached.lastUpdate > Date.now() - 60000) {
+      return cached.tags;
+    }
+
+    try {
+      const query = new URLSearchParams({
+        id: String(playerId),
+        key: String(apiKey),
+        name: String(playerName),
+        sources: source
+      });
+      const response = await fetch(`https://urchin.ws/cubelify?${query.toString()}`, {
+        headers: { "user-agent": "void-overlay-electron" }
+      });
+      const data = await response.json();
+      const tags = Array.isArray(data?.tags)
+        ? data.tags
+          .map((tag) => String(tag?.tooltip || "").trim())
+          .filter(Boolean)
+        : [];
+      this.urchinCache.set(cacheKey, {
+        lastUpdate: Date.now(),
+        tags
+      });
+      return tags;
+    } catch (_error) {
+      return [];
+    }
+  }
+
+  async attachUrchinTags(result, payload, { config, custom = false } = {}) {
+    if (!["Success", "Winstreak Hidden"].includes(result.status)) {
+      return result;
+    }
+
+    const player = payload?.player;
+    if (!player) {
+      return result;
+    }
+
+    const tags = await this.fetchUrchinTags(player, { config, custom });
+    if (!tags.length) {
+      return result;
+    }
+
+    return {
+      ...result,
+      data: {
+        ...result.data,
+        TAG: this.mergeTags(tags, this.splitTags(result.data?.TAG))
+      }
+    };
   }
 
   parseBedwars(payload, nick = null, custom = false) {

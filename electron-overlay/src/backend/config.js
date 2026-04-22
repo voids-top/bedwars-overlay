@@ -34,6 +34,14 @@ function sanitizeVolume(value, fallback) {
   return Math.max(0, Math.min(1, numeric));
 }
 
+function sanitizeOptionalString(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim();
+  return normalized || null;
+}
+
 function sanitizeConfig(input) {
   const config = { ...DEFAULT_CONFIG, ...(input || {}) };
 
@@ -45,6 +53,9 @@ function sanitizeConfig(input) {
   config.position = Number.isFinite(Number(config.position)) ? Number(config.position) : DEFAULT_CONFIG.position;
   config.geometry = typeof config.geometry === "string" ? config.geometry : DEFAULT_CONFIG.geometry;
   config.log_file = typeof config.log_file === "string" ? config.log_file : DEFAULT_CONFIG.log_file;
+  config.hypixel_key = sanitizeOptionalString(config.hypixel_key);
+  config.urchin_key = sanitizeOptionalString(config.urchin_key);
+  config.antisniper_key = sanitizeOptionalString(config.antisniper_key);
   config.background = Boolean(config.background);
   config.inject = Boolean(config.inject);
   config.deposit_notify = Boolean(config.deposit_notify);

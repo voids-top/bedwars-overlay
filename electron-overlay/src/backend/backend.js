@@ -92,14 +92,14 @@ class ElectronOverlayBackend {
       sessions: [],
       config: loadConfig()
     };
-    this.processedLogs = new Set();
-    this.processedLogOrder = [];
     this.logTimer = null;
     this.clientTimer = null;
     this.injectTimer = null;
     this.idTimer = null;
     this.lastIdCheck = 0;
     this.lastLogPath = null;
+    this.logReadOffset = 0;
+    this.logLineRemainder = "";
     this.injectAttemptAt = new Map();
     this.noticed = [];
     this.lastNoticeAt = 0;
@@ -220,11 +220,47 @@ class ElectronOverlayBackend {
     }
   }
 
-  resetProcessedLogs(filePath) {
+  resetLogReader(filePath) {
+    let nextOffset = 0;
+    try {
+      nextOffset = fs.statSync(filePath).size;
+    } catch (_error) {
+      nextOffset = 0;
+    }
     this.lastLogPath = filePath;
-    const seeded = [...new Set(this.readLogLines(filePath))];
-    this.processedLogs = new Set(seeded);
-    this.processedLogOrder = seeded;
+    this.logReadOffset = nextOffset;
+    this.logLineRemainder = "";
+  }
+
+  readNewLogLines(filePath) {
+    try {
+      const stat = fs.statSync(filePath);
+      if (this.lastLogPath !== filePath) {
+        this.resetLogReader(filePath);
+        return [];
+      }
+      if (stat.size < this.logReadOffset) {
+        this.logReadOffset = stat.size;
+        this.logLineRemainder = "";
+        return [];
+      }
+      if (stat.size === this.logReadOffset) {
+        return [];
+      }
+
+      const fd = fs.openSync(filePath, "r");
+      const buffer = Buffer.alloc(stat.size - this.logReadOffset);
+      fs.readSync(fd, buffer, 0, buffer.length, this.logReadOffset);
+      fs.closeSync(fd);
+      this.logReadOffset = stat.size;
+
+      const text = `${this.logLineRemainder}${decodeLogBuffer(buffer)}`;
+      const lines = text.split(/\r?\n/);
+      this.logLineRemainder = lines.pop() || "";
+      return lines.filter(Boolean);
+    } catch (_error) {
+      return [];
+    }
   }
 
   async detectClientLog() {
@@ -249,7 +285,7 @@ class ElectronOverlayBackend {
           this.state.client = client;
           this.state.logfile = filePath;
           this.setLog(`Connected to ${client}`);
-          this.resetProcessedLogs(filePath);
+          this.resetLogReader(filePath);
         }
         return true;
       } catch (_error) {
@@ -266,20 +302,9 @@ class ElectronOverlayBackend {
       return;
     }
 
-    const lines = this.readLogLines(filePath);
+    const lines = this.readNewLogLines(filePath);
     for (const line of lines) {
-      if (this.processedLogs.has(line)) {
-        continue;
-      }
-      this.processedLogs.add(line);
-      this.processedLogOrder.push(line);
       this.processLogLine(line);
-    }
-
-    if (this.processedLogOrder.length > 10000) {
-      const keep = this.processedLogOrder.slice(-5000);
-      this.processedLogs = new Set(keep);
-      this.processedLogOrder = keep;
     }
   }
 
